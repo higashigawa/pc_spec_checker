@@ -5,13 +5,15 @@ PC スペックチェッカー
 """
 
 import tkinter as tk
-from tkinter import ttk, font
+from tkinter import ttk, font, filedialog, messagebox
 import platform
 import subprocess
 import threading
 import time
 import os
 import re
+import csv
+from datetime import datetime
 
 try:
     import psutil
@@ -778,6 +780,7 @@ class PCSpecApp(tk.Tk):
         self.configure(bg=BG)
         self.geometry("900x700")
         self.minsize(700, 500)
+        self._spec_data = {}  # CSV出力用データ格納
         self._setup_fonts()
         self._build_ui()
         self._load_data_async()
@@ -800,6 +803,28 @@ class PCSpecApp(tk.Tk):
             bg=PANEL, fg=ACCENT,
             font=self.font_title
         ).pack(side="left", padx=24, pady=14)
+
+        self.xlsx_btn = tk.Button(
+            header, text="📊 Excel出力",
+            bg="#1d6f42", fg=TEXT_MAIN,
+            font=self.font_small,
+            relief="flat", padx=12, pady=4,
+            cursor="hand2",
+            command=self._export_xlsx,
+            state="disabled"
+        )
+        self.xlsx_btn.pack(side="right", padx=(0, 4), pady=14)
+
+        self.csv_btn = tk.Button(
+            header, text="📥 CSV出力",
+            bg=ACCENT2, fg=TEXT_MAIN,
+            font=self.font_small,
+            relief="flat", padx=12, pady=4,
+            cursor="hand2",
+            command=self._export_csv,
+            state="disabled"
+        )
+        self.csv_btn.pack(side="right", padx=(0, 8), pady=14)
 
         self.status_lbl = tk.Label(
             header, text="読み込み中...",
@@ -849,36 +874,369 @@ class PCSpecApp(tk.Tk):
     def _collect_all(self):
         self._update_status("機種情報を取得中...")
         machine_data = get_machine_info()
+        self._spec_data["機種情報"] = machine_data
         self.after(0, lambda: self._render_kv(self.tabs["機種情報"], machine_data, "機種情報"))
 
         self._update_status("OS情報を取得中...")
-        os_data  = get_os_info()
+        os_data = get_os_info()
+        self._spec_data["OS"] = os_data
         self.after(0, lambda: self._render_kv(self.tabs["OS"], os_data))
 
         self._update_status("CPU情報を取得中...")
         cpu_data = get_cpu_info()
+        self._spec_data["CPU"] = cpu_data
         self.after(0, lambda: self._render_cpu(self.tabs["CPU"], cpu_data))
 
         self._update_status("メモリ情報を取得中...")
         mem_data = get_memory_info()
+        self._spec_data["メモリ"] = mem_data
         self.after(0, lambda: self._render_memory(self.tabs["メモリ"], mem_data))
 
         self._update_status("ストレージ情報を取得中...")
         disk_data = get_disk_info()
+        self._spec_data["ストレージ"] = disk_data
         self.after(0, lambda: self._render_disks(self.tabs["ストレージ"], disk_data))
 
         self._update_status("GPU情報を取得中...")
         gpu_data = get_gpu_info()
+        self._spec_data["GPU"] = gpu_data
         self.after(0, lambda: self._render_gpu(self.tabs["GPU"], gpu_data))
 
         self._update_status("ネットワーク情報を取得中...")
         net_data = get_network_info()
+        self._spec_data["ネットワーク"] = net_data
         self.after(0, lambda: self._render_network(self.tabs["ネットワーク"], net_data))
 
         self._update_status("完了")
+        self.after(0, lambda: self.csv_btn.config(state="normal"))
+        self.after(0, lambda: self.xlsx_btn.config(state="normal"))
 
     def _update_status(self, msg):
         self.after(0, lambda: self.status_lbl.config(text=msg))
+
+    def _get_default_stem(self):
+        """ファイル名のベース部分（拡張子なし）を生成"""
+        hostname  = platform.node() or "unknown"
+        serial    = self._spec_data.get("機種情報", {}).get("シリアルNo.", "") or ""
+        safe_host = re.sub(r'[\\/:*?"<>|]', "_", hostname)
+        safe_ser  = re.sub(r'[\\/:*?"<>|]', "_", serial)
+        parts = ["pc_spec", safe_host]
+        if safe_ser:
+            parts.append(safe_ser)
+        parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        return "_".join(parts)
+
+    def _export_xlsx(self):
+        """全スペック情報を見やすい書式付き Excel ファイルに出力する"""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            if messagebox.askyesno(
+                "openpyxl が見つかりません",
+                "Excel出力には openpyxl が必要です。\n今すぐインストールしますか?\n\n  pip install openpyxl"
+            ):
+                import subprocess as _sp, sys as _sys
+                try:
+                    _sp.run([_sys.executable, "-m", "pip", "install", "openpyxl"], check=True)
+                    messagebox.showinfo("完了", "インストール完了。もう一度「Excel出力」を押してください。")
+                except Exception as e:
+                    messagebox.showerror("エラー", "インストール失敗:\n" + str(e))
+            return
+
+        stem = self._get_default_stem()
+        path = filedialog.asksaveasfilename(
+            title="Excelの保存先を選択",
+            defaultextension=".xlsx",
+            initialfile=stem + ".xlsx",
+            filetypes=[("Excelファイル", "*.xlsx"), ("すべてのファイル", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            wb = openpyxl.Workbook()
+            wb.remove(wb.active)
+
+            hostname = platform.node() or "unknown"
+            serial   = self._spec_data.get("機種情報", {}).get("シリアルNo.", "") or ""
+            now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # ═══════════════════════════════════════════
+            # カラーパレット（ライト / ビジネス向け）
+            # ═══════════════════════════════════════════
+            C = {
+                "hdr_bg"   : "17375E",   # 濃紺  ヘッダー背景
+                "hdr_fg"   : "FFFFFF",   # 白    ヘッダー文字
+                "acc_bg"   : "2E75B6",   # 中青  アクセント見出し背景
+                "acc_fg"   : "FFFFFF",
+                "sub_bg"   : "D6E4F0",   # 薄青  サブ見出し背景
+                "sub_fg"   : "17375E",
+                "odd_bg"   : "FFFFFF",   # 白    奇数行
+                "even_bg"  : "EBF3FB",   # 極薄青 偶数行
+                "key_fg"   : "404040",   # 濃グレー キー
+                "val_fg"   : "17375E",   # 濃紺   値
+                "title_bg" : "17375E",   # タイトル帯
+                "title_fg" : "FFFFFF",
+                "info_bg"  : "D6E4F0",   # PC情報帯
+                "info_fg"  : "17375E",
+                "bdr"      : "B8CCE4",   # 罫線
+                "bdr_acc"  : "2E75B6",   # アクセント罫線
+                "sum_cat"  : "1F497D",   # サマリーカテゴリ列
+            }
+
+            # ── スタイルヘルパー ───────────────────────
+            def F(color=None, bold=False, size=10, italic=False):
+                return Font(name="Yu Gothic UI" if platform.system()=="Windows" else "Helvetica Neue",
+                            color=color or C["key_fg"], bold=bold, size=size, italic=italic)
+
+            def Fill(hex_c):
+                return PatternFill("solid", fgColor=hex_c)
+
+            def Al(h="left", v="center", wrap=False, indent=0):
+                return Alignment(horizontal=h, vertical=v, wrap_text=wrap, indent=indent)
+
+            def Bdr(color=None, style="thin"):
+                s = Side(style=style, color=color or C["bdr"])
+                return Border(left=s, right=s, top=s, bottom=s)
+
+            def BdrAccBottom(top_color=None):
+                t  = Side(style="thin",   color=top_color or C["bdr"])
+                ac = Side(style="medium", color=C["bdr_acc"])
+                return Border(left=t, right=t, top=t, bottom=ac)
+
+            def set_col_widths(ws, widths):
+                for i, w in enumerate(widths, 1):
+                    ws.column_dimensions[get_column_letter(i)].width = w
+
+            def freeze(ws, cell="A5"):
+                ws.freeze_panes = cell
+
+            def make_sheet(title, tab_color="17375E"):
+                ws = wb.create_sheet(title=title)
+                ws.sheet_view.showGridLines = False
+                ws.sheet_properties.tabColor = tab_color
+                return ws
+
+            # ── 共通ブロック描画 ──────────────────────
+
+            def draw_title_bar(ws, row, text, ncols=3):
+                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                c = ws.cell(row=row, column=1, value=text)
+                c.fill = Fill(C["title_bg"]); c.font = F(C["title_fg"], bold=True, size=14)
+                c.alignment = Al(h="center"); c.border = Bdr(C["title_bg"])
+                ws.row_dimensions[row].height = 38
+                return row + 1
+
+            def draw_info_bar(ws, row, ncols=3):
+                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                serial_part = f"  │  シリアルNo: {serial}" if serial else ""
+                c = ws.cell(row=row, column=1,
+                            value=f"  PC名: {hostname}{serial_part}  │  出力日時: {now_str}")
+                c.fill = Fill(C["info_bg"]); c.font = F(C["info_fg"], bold=False, size=9)
+                c.alignment = Al(); c.border = BdrAccBottom()
+                ws.row_dimensions[row].height = 20
+                return row + 1
+
+            def draw_col_header(ws, row, labels, ncols=None):
+                n = ncols or len(labels)
+                for ci, lbl in enumerate(labels, 1):
+                    c = ws.cell(row=row, column=ci, value=lbl)
+                    c.fill = Fill(C["hdr_bg"]); c.font = F(C["hdr_fg"], bold=True, size=10)
+                    c.alignment = Al(h="center"); c.border = Bdr(C["hdr_bg"])
+                ws.row_dimensions[row].height = 22
+                return row + 1
+
+            def draw_section_header(ws, row, text, ncols=3):
+                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                c = ws.cell(row=row, column=1, value=f"  ◆  {text}")
+                c.fill = Fill(C["acc_bg"]); c.font = F(C["acc_fg"], bold=True, size=11)
+                c.alignment = Al(); c.border = BdrAccBottom()
+                ws.row_dimensions[row].height = 24
+                return row + 1
+
+            def draw_sub_header(ws, row, text, ncols=3):
+                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                c = ws.cell(row=row, column=1, value=f"    ▸  {text}")
+                c.fill = Fill(C["sub_bg"]); c.font = F(C["sub_fg"], bold=True, size=10)
+                c.alignment = Al(); c.border = Bdr(C["bdr_acc"], style="thin")
+                ws.row_dimensions[row].height = 20
+                return row + 1
+
+            def draw_kv(ws, row, key, value, idx=0, ncols=3):
+                bg = C["odd_bg"] if idx % 2 == 0 else C["even_bg"]
+                kc = ws.cell(row=row, column=1, value=key)
+                kc.fill = Fill(bg); kc.font = F(C["key_fg"], size=10)
+                kc.alignment = Al(indent=1); kc.border = Bdr()
+
+                ws.merge_cells(f"B{row}:{get_column_letter(ncols)}{row}")
+                vc = ws.cell(row=row, column=2, value=str(value) if value else "—")
+                vc.fill = Fill(bg); vc.font = F(C["val_fg"], bold=True, size=10)
+                vc.alignment = Al(wrap=True); vc.border = Bdr()
+                ws.row_dimensions[row].height = 18
+                return row + 1
+
+            def draw_empty(ws, row, ncols=3):
+                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                c = ws.cell(row=row, column=1, value="")
+                c.fill = Fill("FFFFFF"); c.border = Bdr("FFFFFF")
+                ws.row_dimensions[row].height = 6
+                return row + 1
+
+            cat_icons = {
+                "機種情報": "🖥 機種情報", "OS": "💻 OS",
+                "CPU": "⚡ CPU",      "メモリ": "🧠 メモリ",
+                "ストレージ": "💾 ストレージ", "GPU": "🎮 GPU",
+                "ネットワーク": "🌐 ネットワーク",
+            }
+            tab_colors = {
+                "機種情報": "17375E", "OS": "375623", "CPU": "7B3F00",
+                "メモリ": "4A235A", "ストレージ": "78290F",
+                "GPU": "1C3A5E", "ネットワーク": "1A472A",
+            }
+
+            # ═══════════════════════════════════════════
+            # ① サマリーシート
+            # ═══════════════════════════════════════════
+            ws_s = make_sheet("📋 サマリー", "17375E")
+            set_col_widths(ws_s, [20, 28, 42])
+
+            row = draw_title_bar(ws_s, 1, "🖥  PC SPEC CHECKER  ─  スペック一覧")
+            row = draw_info_bar(ws_s, row)
+            row = draw_empty(ws_s, row)
+            row = draw_col_header(ws_s, row, ["カテゴリ", "項目", "値"])
+            freeze(ws_s, f"A{row}")
+
+            idx = 0
+            prev_cat = None
+            for cat, data in self._spec_data.items():
+                rows_to_write = []
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        rows_to_write.append((cat, k, str(v) if v else "—"))
+                elif isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        sub = (item.get("マウント") or item.get("GPU名")
+                               or item.get("インターフェース") or item.get("備考") or "")
+                        lbl = f"{cat}  ({sub})" if sub else cat
+                        for k, v in item.items():
+                            rows_to_write.append((lbl, k, str(v) if v else "—"))
+
+                for cat_lbl, k, v in rows_to_write:
+                    bg = C["odd_bg"] if idx % 2 == 0 else C["even_bg"]
+                    # カテゴリ列
+                    cc = ws_s.cell(row=row, column=1, value=cat_lbl if cat_lbl != prev_cat else "")
+                    cc.fill = Fill(bg); cc.font = F(C["sum_cat"], bold=(cat_lbl != prev_cat), size=9)
+                    cc.alignment = Al(indent=1); cc.border = Bdr()
+                    prev_cat = cat_lbl
+                    # キー列
+                    kc = ws_s.cell(row=row, column=2, value=k)
+                    kc.fill = Fill(bg); kc.font = F(C["key_fg"], size=10)
+                    kc.alignment = Al(indent=1); kc.border = Bdr()
+                    # 値列
+                    vc = ws_s.cell(row=row, column=3, value=v)
+                    vc.fill = Fill(bg); vc.font = F(C["val_fg"], bold=True, size=10)
+                    vc.alignment = Al(wrap=True); vc.border = Bdr()
+                    ws_s.row_dimensions[row].height = 18
+                    row += 1; idx += 1
+
+            # ═══════════════════════════════════════════
+            # ② カテゴリ別シート
+            # ═══════════════════════════════════════════
+            for cat, data in self._spec_data.items():
+                icon  = cat_icons.get(cat, cat)
+                tcolor = tab_colors.get(cat, "17375E")
+                ws = make_sheet(icon, tcolor)
+                set_col_widths(ws, [30, 45, 0])  # C列は非表示（merge先）
+
+                r = draw_title_bar(ws, 1, icon)
+                r = draw_info_bar(ws, r)
+                r = draw_empty(ws, r)
+
+                if isinstance(data, dict):
+                    r = draw_section_header(ws, r, cat)
+                    r = draw_col_header(ws, r, ["項目", "値"])
+                    for i, (k, v) in enumerate(data.items()):
+                        r = draw_kv(ws, r, k, v, i)
+                    freeze(ws, f"A{r - len(data)}")
+
+                elif isinstance(data, list):
+                    r = draw_col_header(ws, r, ["項目", "値"])
+                    freeze(ws, f"A{r}")
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        sub = (item.get("マウント") or item.get("GPU名")
+                               or item.get("インターフェース") or item.get("備考") or "")
+                        r = draw_sub_header(ws, r, sub or cat)
+                        for i, (k, v) in enumerate(item.items()):
+                            r = draw_kv(ws, r, k, v, i)
+                        r = draw_empty(ws, r)
+
+            wb.save(path)
+            messagebox.showinfo("Excel出力完了", "スペック情報を保存しました。\n\n" + path)
+
+        except Exception as e:
+            messagebox.showerror("エラー", "Excel出力に失敗しました。\n\n" + str(e))
+
+    def _export_csv(self):
+        """全スペック情報を CSV ファイルに出力する"""
+        hostname = platform.node() or "unknown"
+        default_name = self._get_default_stem() + ".csv"
+        path = filedialog.asksaveasfilename(
+            title="CSVの保存先を選択",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSVファイル", "*.csv"), ("すべてのファイル", "*.*")]
+        )
+        if not path:
+            return  # キャンセル
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["PC名", hostname])
+                writer.writerow(["出力日時", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow([])
+                writer.writerow(["カテゴリ", "項目", "値"])
+                writer.writerow([])
+
+                for category, data in self._spec_data.items():
+                    if isinstance(data, dict):
+                        # OS, CPU, メモリ, 機種情報
+                        for key, val in data.items():
+                            writer.writerow([category, key, val])
+                        writer.writerow([])
+
+                    elif isinstance(data, list):
+                        for i, item in enumerate(data):
+                            if not isinstance(item, dict):
+                                continue
+                            # ストレージ: マウント名、GPU: GPU名、ネットワーク: インターフェース名を小見出しに
+                            subtitle = (
+                                item.get("マウント")
+                                or item.get("GPU名")
+                                or item.get("インターフェース")
+                                or item.get("備考")
+                                or f"#{i+1}"
+                            )
+                            for key, val in item.items():
+                                writer.writerow([f"{category} ({subtitle})", key, val])
+                            writer.writerow([])
+
+            messagebox.showinfo(
+                "CSV出力完了",
+                "スペック情報を保存しました。\n\n" + path
+            )
+        except Exception as e:
+            messagebox.showerror("エラー", "CSV出力に失敗しました。\n\n" + str(e))
 
     # ── レンダリング ────────────────────────────
     def _scrollable(self, parent):
