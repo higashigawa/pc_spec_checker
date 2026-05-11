@@ -545,46 +545,228 @@ def get_os_info():
     return info
 
 
-def get_gpu_info():
-    info = {}
-    sys = platform.system()
-    if sys == "Darwin":
-        out = run_command(
-            ["system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"]
+def _ps_run(script):
+    """PowerShell コマンドを実行して stdout を返す"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=15
         )
-        gpu_name = None
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def get_gpu_info():
+    """GPU情報を返す。戻り値は list of dict (GPU ごとに 1 dict)"""
+    gpus = []
+    sys_name = platform.system()
+
+    if sys_name == "Darwin":
+        # system_profiler で確実に取得
+        out = run_command(["system_profiler", "SPDisplaysDataType"])
+        current = {}
         for line in out.splitlines():
             line = line.strip()
             if "Chipset Model:" in line:
-                gpu_name = line.split(":", 1)[1].strip()
-            elif "VRAM" in line and gpu_name:
-                vram = line.split(":", 1)[1].strip()
-                info[gpu_name] = vram
-                gpu_name = None
-        if gpu_name:
-            info[gpu_name] = "VRAM不明"
-    elif sys == "Linux":
-        out = run_command(["lspci"])
-        for line in out.splitlines():
-            if "VGA" in line or "3D" in line or "Display" in line:
-                parts = line.split(":", 2)
+                if current:
+                    gpus.append(current)
+                current = {"GPU名": line.split(":", 1)[1].strip()}
+            elif current:
+                for keyword, label in [
+                    ("VRAM",         "VRAM"),
+                    ("Vendor:",      "ベンダー"),
+                    ("Device ID:",   "デバイスID"),
+                    ("Metal:",       "Metal対応"),
+                    ("Resolution:",  "解像度"),
+                    ("Displays:",    "接続ディスプレイ数"),
+                ]:
+                    if keyword in line:
+                        current[label] = line.split(":", 1)[1].strip()
+        if current:
+            gpus.append(current)
+
+    elif sys_name == "Linux":
+        # ① lspci (pciutils)
+        for lspci_cmd in [["lspci", "-vmm"], ["lspci", "-v"], ["lspci"]]:
+            lspci_out = run_command(lspci_cmd)
+            if lspci_out:
+                break
+
+        if lspci_out:
+            current = {}
+            in_gpu = False
+            for line in lspci_out.splitlines():
+                # -vmm 形式: "Class:	VGA..." などフラットに来る
+                if re.match(r"^Class:\s+(VGA|3D|Display)", line):
+                    if current:
+                        gpus.append(current)
+                    current = {}
+                    in_gpu = True
+                elif in_gpu and line.startswith("Device:"):
+                    current["GPU名"] = line.split(":", 1)[1].strip()
+                elif in_gpu and line.startswith("SVendor:"):
+                    current["ベンダー"] = line.split(":", 1)[1].strip()
+                elif in_gpu and line.startswith("Driver:"):
+                    current["カーネルドライバ"] = line.split(":", 1)[1].strip()
+                elif not line.strip() and in_gpu:
+                    in_gpu = False
+
+            # 通常 lspci 形式のフォールバック
+            if not current and not gpus:
+                for line in lspci_out.splitlines():
+                    if any(k in line for k in ("VGA", "3D controller", "Display controller")):
+                        parts = line.split(":", 2)
+                        name = parts[2].strip() if len(parts) >= 3 else line
+                        current = {"GPU名": name}
+                    elif current and line.startswith("	"):
+                        if "Kernel driver" in line:
+                            current["カーネルドライバ"] = line.split(":", 1)[1].strip()
+            if current:
+                gpus.append(current)
+
+        # ② /sys/class/drm フォールバック (lspci なし環境)
+        if not gpus:
+            drm_path = "/sys/class/drm"
+            try:
+                cards = [d for d in os.listdir(drm_path)
+                         if re.match(r"^card\d+$", d)]
+                for card in sorted(cards):
+                    vendor_file = os.path.join(drm_path, card, "device", "vendor")
+                    device_file = os.path.join(drm_path, card, "device", "device")
+                    try:
+                        vendor = open(vendor_file).read().strip()
+                        device = open(device_file).read().strip()
+                        gpus.append({"GPU名": f"{card} (vendor={vendor} device={device})"})
+                    except Exception:
+                        gpus.append({"GPU名": card})
+            except Exception:
+                pass
+
+        # ③ nvidia-smi (NVIDIA GPU 専用)
+        nsmi = run_command(["nvidia-smi",
+                            "--query-gpu=name,memory.total,driver_version",
+                            "--format=csv,noheader,nounits"])
+        if nsmi:
+            for line in nsmi.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                entry = {"GPU名": parts[0]} if parts else {}
+                if len(parts) >= 2:
+                    try:
+                        entry["VRAM"] = f"{int(parts[1])/1024:.1f} GB"
+                    except ValueError:
+                        entry["VRAM"] = parts[1]
                 if len(parts) >= 3:
-                    info[parts[2].strip()] = ""
-    elif sys == "Windows":
-        out = run_command("wmic path win32_VideoController get Name,AdapterRAM /value")
-        gpu = {}
+                    entry["ドライババージョン"] = parts[2]
+                if entry:
+                    # 既存エントリと統合
+                    matched = False
+                    for g in gpus:
+                        if parts[0].lower() in g.get("GPU名", "").lower():
+                            g.update(entry)
+                            matched = True
+                            break
+                    if not matched:
+                        gpus.append(entry)
+
+        if not gpus:
+            gpus.append({"備考": "GPU情報を取得できませんでした (pciutils/lspci をインストールしてください)"})
+
+    elif sys_name == "Windows":
+        # PowerShell CIM で取得（WMIC 廃止対応）
+        # 各プロパティを個別行で出力してパース
+        ps_script = (
+            "Get-CimInstance Win32_VideoController | ForEach-Object {"
+            "  $ram = 0;"
+            "  if ($_.AdapterRAM -and $_.AdapterRAM -gt 0) {"
+            "    $ram = [math]::Round($_.AdapterRAM / 1073741824, 1)"
+            "  };"
+            "  $rx = if ($_.CurrentHorizontalResolution) { $_.CurrentHorizontalResolution } else { 0 };"
+            "  $ry = if ($_.CurrentVerticalResolution)   { $_.CurrentVerticalResolution   } else { 0 };"
+            "  $hz = if ($_.CurrentRefreshRate)          { $_.CurrentRefreshRate          } else { 0 };"
+            "  Write-Output ('---GPU---');"
+            "  Write-Output ('NAME:'     + $_.Name);"
+            "  Write-Output ('VRAM:'     + $ram);"
+            "  Write-Output ('DRIVER:'   + $_.DriverVersion);"
+            "  Write-Output ('PROC:'     + $_.VideoProcessor);"
+            "  Write-Output ('RESX:'     + $rx);"
+            "  Write-Output ('RESY:'     + $ry);"
+            "  Write-Output ('HZ:'       + $hz);"
+            "  Write-Output ('STATUS:'   + $_.Status)"
+            "}"
+        )
+        out = _ps_run(ps_script)
+        current = {}
         for line in out.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                gpu[k.strip()] = v.strip()
-            elif not line.strip() and gpu:
-                name = gpu.get("Name", "")
-                ram  = gpu.get("AdapterRAM", "0")
-                if name:
-                    vram = f"{int(ram)/(1024**3):.1f} GB" if ram.isdigit() and int(ram) > 0 else "不明"
-                    info[name] = vram
-                gpu = {}
-    return info
+            line = line.strip()
+            if line == "---GPU---":
+                if current.get("GPU名"):
+                    gpus.append(current)
+                current = {}
+            elif ":" in line:
+                key, val = line.split(":", 1)
+                val = val.strip()
+                if key == "NAME" and val:
+                    current["GPU名"] = val
+                elif key == "VRAM":
+                    try:
+                        f = float(val)
+                        current["VRAM"] = f"{f:.1f} GB" if f > 0 else "共有メモリ (統合GPU)"
+                    except ValueError:
+                        pass
+                elif key == "DRIVER" and val:
+                    current["ドライババージョン"] = val
+                elif key == "PROC" and val:
+                    current["ビデオプロセッサ"] = val
+                elif key == "RESX" and val not in ("", "0"):
+                    current.setdefault("_rx", val)
+                elif key == "RESY" and val not in ("", "0"):
+                    current.setdefault("_ry", val)
+                elif key == "HZ" and val not in ("", "0"):
+                    current.setdefault("_hz", val)
+                elif key == "STATUS" and val:
+                    current["ステータス"] = val
+        if current.get("GPU名"):
+            gpus.append(current)
+
+        # 解像度を結合
+        for g in gpus:
+            rx = g.pop("_rx", None)
+            ry = g.pop("_ry", None)
+            hz = g.pop("_hz", None)
+            if rx and ry:
+                g["現在の解像度"] = f"{rx} x {ry}"
+            if hz:
+                g["リフレッシュレート"] = f"{hz} Hz"
+
+        # フォールバック: Get-WmiObject (古い PowerShell 向け)
+        if not gpus:
+            fb_script = (
+                "Get-WmiObject Win32_VideoController | ForEach-Object {"
+                "  Write-Output ('---GPU---');"
+                "  Write-Output ('NAME:'   + $_.Name);"
+                "  Write-Output ('DRIVER:' + $_.DriverVersion)"
+                "}"
+            )
+            out2 = _ps_run(fb_script)
+            current = {}
+            for line in out2.splitlines():
+                line = line.strip()
+                if line == "---GPU---":
+                    if current.get("GPU名"):
+                        gpus.append(current)
+                    current = {}
+                elif line.startswith("NAME:") and line[5:].strip():
+                    current["GPU名"] = line[5:].strip()
+                elif line.startswith("DRIVER:") and line[7:].strip():
+                    current["ドライババージョン"] = line[7:].strip()
+            if current.get("GPU名"):
+                gpus.append(current)
+
+        if not gpus:
+            gpus.append({"備考": "GPU情報を取得できませんでした"})
+
+    return gpus
 
 
 # ── ウィジェット構築 ─────────────────────────────
@@ -687,7 +869,7 @@ class PCSpecApp(tk.Tk):
 
         self._update_status("GPU情報を取得中...")
         gpu_data = get_gpu_info()
-        self.after(0, lambda: self._render_kv(self.tabs["GPU"], gpu_data, "GPU"))
+        self.after(0, lambda: self._render_gpu(self.tabs["GPU"], gpu_data))
 
         self._update_status("ネットワーク情報を取得中...")
         net_data = get_network_info()
@@ -848,6 +1030,20 @@ class PCSpecApp(tk.Tk):
             except ValueError:
                 pass
 
+
+    def _render_gpu(self, tab, gpus: list):
+        frame = self._scrollable(tab)
+        if not gpus:
+            self._section_label(frame, "GPU")
+            tk.Label(frame, text="情報を取得できませんでした",
+                     bg=BG, fg=TEXT_SUB, font=self.font_label).pack(padx=32, pady=10)
+            return
+        for gpu in gpus:
+            name = gpu.get("GPU名") or gpu.get("備考", "GPU")
+            self._section_label(frame, name)
+            items = [(k, v) for k, v in gpu.items() if k != "GPU名"]
+            for i, (k, v) in enumerate(items):
+                self._kv_row(frame, k, v, alt=(i % 2 == 1))
 
     def _render_network(self, tab, interfaces: list):
         frame = self._scrollable(tab)
