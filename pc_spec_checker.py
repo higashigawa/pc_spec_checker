@@ -1363,13 +1363,34 @@ class PCSpecApp(tk.Tk):
                 return Alignment(horizontal=h, vertical=v, wrap_text=wrap, indent=indent)
 
             def Bdr(color=None, style="thin"):
+                """全辺均一罫線"""
                 s = Side(style=style, color=color or C["bdr"])
                 return Border(left=s, right=s, top=s, bottom=s)
 
-            def BdrAccBottom(top_color=None):
-                t  = Side(style="thin",   color=top_color or C["bdr"])
-                ac = Side(style="medium", color=C["bdr_acc"])
-                return Border(left=t, right=t, top=t, bottom=ac)
+            def BdrOuter(ncols, col):
+                """左端・右端・中間で外枠/内線を使い分け"""
+                bdr_c = C["bdr"]
+                left  = Side(style="medium" if col == 1     else "thin", color=bdr_c)
+                right = Side(style="medium" if col == ncols else "thin", color=bdr_c)
+                top   = Side(style="thin",   color=bdr_c)
+                bot   = Side(style="thin",   color=bdr_c)
+                return Border(left=left, right=right, top=top, bottom=bot)
+
+            def BdrAccBottom(ncols=1, col=1):
+                """下辺をアクセント色mediumにした罫線"""
+                bdr_c = C["bdr"]
+                left  = Side(style="medium" if col == 1     else "thin", color=bdr_c)
+                right = Side(style="medium" if col == ncols else "thin", color=bdr_c)
+                top   = Side(style="thin",   color=bdr_c)
+                bot   = Side(style="medium", color=C["bdr_acc"])
+                return Border(left=left, right=right, top=top, bottom=bot)
+
+            def apply_merge_border(ws, row, ncols, fill_obj, bdr_func, *args):
+                """マージセルの全列にきちんと罫線を適用するユーティリティ"""
+                for ci in range(1, ncols + 1):
+                    c = ws.cell(row=row, column=ci)
+                    c.fill   = fill_obj
+                    c.border = bdr_func(ncols, ci, *args)
 
             def set_col_widths(ws, widths):
                 for i, w in enumerate(widths, 1):
@@ -1390,7 +1411,16 @@ class PCSpecApp(tk.Tk):
                 ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
                 c = ws.cell(row=row, column=1, value=text)
                 c.fill = Fill(C["title_bg"]); c.font = F(C["title_fg"], bold=True, size=14)
-                c.alignment = Al(h="center"); c.border = Bdr(C["title_bg"])
+                c.alignment = Al(h="center")
+                # マージ全列に外枠罫線
+                for ci in range(1, ncols + 1):
+                    cell = ws.cell(row=row, column=ci)
+                    cell.fill = Fill(C["title_bg"])
+                    left  = Side(style="medium" if ci == 1     else "thin", color=C["title_bg"])
+                    right = Side(style="medium" if ci == ncols else "thin", color=C["title_bg"])
+                    top   = Side(style="medium", color=C["title_bg"])
+                    bot   = Side(style="thin",   color=C["bdr"])
+                    cell.border = Border(left=left, right=right, top=top, bottom=bot)
                 ws.row_dimensions[row].height = 38
                 return row + 1
 
@@ -1400,16 +1430,30 @@ class PCSpecApp(tk.Tk):
                 c = ws.cell(row=row, column=1,
                             value=f"  PC名: {hostname}{serial_part}  │  出力日時: {now_str}")
                 c.fill = Fill(C["info_bg"]); c.font = F(C["info_fg"], bold=False, size=9)
-                c.alignment = Al(); c.border = BdrAccBottom()
+                c.alignment = Al()
+                for ci in range(1, ncols + 1):
+                    cell = ws.cell(row=row, column=ci)
+                    cell.fill = Fill(C["info_bg"])
+                    left  = Side(style="medium" if ci == 1     else "thin", color=C["bdr"])
+                    right = Side(style="medium" if ci == ncols else "thin", color=C["bdr"])
+                    top   = Side(style="thin",   color=C["bdr"])
+                    bot   = Side(style="medium", color=C["bdr_acc"])
+                    cell.border = Border(left=left, right=right, top=top, bottom=bot)
                 ws.row_dimensions[row].height = 20
                 return row + 1
 
             def draw_col_header(ws, row, labels, ncols=None):
+                """列ヘッダー: 各セルに独立した罫線（外枠medium, 内線thin）"""
                 n = ncols or len(labels)
                 for ci, lbl in enumerate(labels, 1):
                     c = ws.cell(row=row, column=ci, value=lbl)
                     c.fill = Fill(C["hdr_bg"]); c.font = F(C["hdr_fg"], bold=True, size=10)
-                    c.alignment = Al(h="center"); c.border = Bdr(C["hdr_bg"])
+                    c.alignment = Al(h="center")
+                    left  = Side(style="medium" if ci == 1  else "thin", color=C["hdr_bg"])
+                    right = Side(style="medium" if ci == n  else "thin", color=C["hdr_bg"])
+                    top   = Side(style="medium", color=C["hdr_bg"])
+                    bot   = Side(style="medium", color=C["bdr_acc"])
+                    c.border = Border(left=left, right=right, top=top, bottom=bot)
                 ws.row_dimensions[row].height = 22
                 return row + 1
 
@@ -1417,7 +1461,15 @@ class PCSpecApp(tk.Tk):
                 ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
                 c = ws.cell(row=row, column=1, value=f"  ◆  {text}")
                 c.fill = Fill(C["acc_bg"]); c.font = F(C["acc_fg"], bold=True, size=11)
-                c.alignment = Al(); c.border = BdrAccBottom()
+                c.alignment = Al()
+                for ci in range(1, ncols + 1):
+                    cell = ws.cell(row=row, column=ci)
+                    cell.fill = Fill(C["acc_bg"])
+                    left  = Side(style="medium" if ci == 1     else "thin", color=C["bdr"])
+                    right = Side(style="medium" if ci == ncols else "thin", color=C["bdr"])
+                    top   = Side(style="thin",   color=C["bdr"])
+                    bot   = Side(style="medium", color=C["bdr_acc"])
+                    cell.border = Border(left=left, right=right, top=top, bottom=bot)
                 ws.row_dimensions[row].height = 24
                 return row + 1
 
@@ -1425,27 +1477,57 @@ class PCSpecApp(tk.Tk):
                 ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
                 c = ws.cell(row=row, column=1, value=f"    ▸  {text}")
                 c.fill = Fill(C["sub_bg"]); c.font = F(C["sub_fg"], bold=True, size=10)
-                c.alignment = Al(); c.border = Bdr(C["bdr_acc"], style="thin")
+                c.alignment = Al()
+                for ci in range(1, ncols + 1):
+                    cell = ws.cell(row=row, column=ci)
+                    cell.fill = Fill(C["sub_bg"])
+                    left  = Side(style="medium" if ci == 1     else "thin", color=C["bdr"])
+                    right = Side(style="medium" if ci == ncols else "thin", color=C["bdr"])
+                    top   = Side(style="thin",   color=C["bdr"])
+                    bot   = Side(style="thin",   color=C["bdr_acc"])
+                    cell.border = Border(left=left, right=right, top=top, bottom=bot)
                 ws.row_dimensions[row].height = 20
                 return row + 1
 
             def draw_kv(ws, row, key, value, idx=0, ncols=3):
+                """キー列(A) + 値列(B〜最終列マージ) のデータ行"""
                 bg = C["odd_bg"] if idx % 2 == 0 else C["even_bg"]
+                # キー列 (A)
                 kc = ws.cell(row=row, column=1, value=key)
                 kc.fill = Fill(bg); kc.font = F(C["key_fg"], size=10)
-                kc.alignment = Al(indent=1); kc.border = Bdr()
-
-                ws.merge_cells(f"B{row}:{get_column_letter(ncols)}{row}")
-                vc = ws.cell(row=row, column=2, value=str(value) if value else "—")
-                vc.fill = Fill(bg); vc.font = F(C["val_fg"], bold=True, size=10)
-                vc.alignment = Al(wrap=True); vc.border = Bdr()
+                kc.alignment = Al(indent=1)
+                kc.border = Border(
+                    left   = Side(style="medium", color=C["bdr"]),
+                    right  = Side(style="thin",   color=C["bdr"]),
+                    top    = Side(style="thin",   color=C["bdr"]),
+                    bottom = Side(style="thin",   color=C["bdr"]),
+                )
+                # 値列 (B〜ncols): マージしつつ全セルに罫線
+                if ncols >= 2:
+                    ws.merge_cells(f"B{row}:{get_column_letter(ncols)}{row}")
+                    for ci in range(2, ncols + 1):
+                        cell = ws.cell(row=row, column=ci)
+                        cell.fill = Fill(bg)
+                        left  = Side(style="thin",   color=C["bdr"])
+                        right = Side(style="medium" if ci == ncols else "thin", color=C["bdr"])
+                        top   = Side(style="thin",   color=C["bdr"])
+                        bot   = Side(style="thin",   color=C["bdr"])
+                        cell.border = Border(left=left, right=right, top=top, bottom=bot)
+                    vc = ws.cell(row=row, column=2,
+                                 value=str(value) if value else "—")
+                    vc.font = F(C["val_fg"], bold=True, size=10)
+                    vc.alignment = Al(wrap=True)
                 ws.row_dimensions[row].height = 18
                 return row + 1
 
             def draw_empty(ws, row, ncols=3):
-                ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
-                c = ws.cell(row=row, column=1, value="")
-                c.fill = Fill("FFFFFF"); c.border = Bdr("FFFFFF")
+                """区切り空白行: 罫線なし・背景白"""
+                if ncols > 1:
+                    ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+                for ci in range(1, ncols + 1):
+                    cell = ws.cell(row=row, column=ci)
+                    cell.fill   = Fill("FFFFFF")
+                    cell.border = Border()   # 罫線なし（前行の下罫線だけ残す）
                 ws.row_dimensions[row].height = 6
                 return row + 1
 
