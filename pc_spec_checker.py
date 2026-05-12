@@ -205,6 +205,357 @@ def get_disk_info():
     return disks
 
 
+def get_printer_info():
+    """インストール済みプリンター一覧を返す。戻り値: list of dict"""
+    printers = []
+    sys_name = platform.system()
+
+    if sys_name == "Windows":
+        import tempfile
+
+        STATUS_MAP = {
+            "1": "その他", "2": "不明", "3": "待機中", "4": "印刷中",
+            "5": "暖機中", "6": "停止中", "7": "オフライン",
+        }
+
+        def _parse_printer_lines(text):
+            """---PRINTER--- 区切りのテキストをパースして list of dict を返す"""
+            result = []
+            mapping = {
+                "NAME": "プリンター名", "DRIVER": "ドライバー",
+                "PORT": "ポート",       "STATUS": "状態",
+                "DEFAULT": "既定",      "SHARED": "共有",
+                "COMMENT": "コメント",
+            }
+            cur = {}
+            for raw in text.splitlines():
+                raw = raw.strip()
+                if raw == "---PRINTER---":
+                    if cur.get("プリンター名"):
+                        result.append(cur)
+                    cur = {}
+                elif raw.startswith("STATUS:"):
+                    val = raw[7:].strip()
+                    cur["状態"] = STATUS_MAP.get(val, val) if val else "不明"
+                elif ":" in raw:
+                    key, val = raw.split(":", 1)
+                    val = val.strip()
+                    label = mapping.get(key.strip())
+                    if label and val:
+                        cur[label] = val
+            if cur.get("プリンター名"):
+                result.append(cur)
+            return result
+
+        # ── 方法1: PowerShell ファイル実行 ──────────────────
+        ps_script = (
+            "$ErrorActionPreference='SilentlyContinue'\n"
+            "$list = Get-CimInstance Win32_Printer\n"
+            "if(-not $list){$list=Get-WmiObject Win32_Printer}\n"
+            "foreach($p in $list){\n"
+            "  Write-Output '---PRINTER---'\n"
+            "  Write-Output ('NAME:'    + $p.Name)\n"
+            "  Write-Output ('DRIVER:'  + $p.DriverName)\n"
+            "  Write-Output ('PORT:'    + $p.PortName)\n"
+            "  Write-Output ('STATUS:'  + $p.PrinterStatus)\n"
+            "  Write-Output ('DEFAULT:' + $(if($p.Default){'はい'}else{'いいえ'}))\n"
+            "  Write-Output ('SHARED:'  + $(if($p.Shared) {'はい'}else{'いいえ'}))\n"
+            "  if($p.Comment){Write-Output ('COMMENT:' + $p.Comment)}\n"
+            "}\n"
+        )
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1',
+                                             delete=False, encoding='utf-8') as tf:
+                tf.write(ps_script)
+                tmp_path = tf.name
+            for ps_exe in ["pwsh", "powershell"]:
+                try:
+                    r = subprocess.run(
+                        [ps_exe, "-NoProfile", "-NonInteractive",
+                         "-ExecutionPolicy", "Bypass", "-File", tmp_path],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if r.returncode == 0 and "---PRINTER---" in r.stdout:
+                        printers = _parse_printer_lines(r.stdout)
+                        break
+                except FileNotFoundError:
+                    continue
+        except Exception:
+            pass
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        # ── 方法2: PowerShell -Command（短いコマンド）────────
+        if not printers:
+            try:
+                cmd = (
+                    "Get-CimInstance Win32_Printer | "
+                    "ForEach-Object { "
+                    "Write-Output '---PRINTER---'; "
+                    "Write-Output ('NAME:'+$_.Name); "
+                    "Write-Output ('DRIVER:'+$_.DriverName); "
+                    "Write-Output ('PORT:'+$_.PortName); "
+                    "Write-Output ('STATUS:'+$_.PrinterStatus); "
+                    "Write-Output ('DEFAULT:'+$(if($_.Default){'はい'}else{'いいえ'})); "
+                    "Write-Output ('SHARED:'+$(if($_.Shared){'はい'}else{'いいえ'})) }"
+                )
+                for ps_exe in ["pwsh", "powershell"]:
+                    try:
+                        r = subprocess.run(
+                            [ps_exe, "-NoProfile", "-NonInteractive",
+                             "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if r.returncode == 0 and "---PRINTER---" in r.stdout:
+                            printers = _parse_printer_lines(r.stdout)
+                            break
+                    except FileNotFoundError:
+                        continue
+            except Exception:
+                pass
+
+        # ── 方法3: wmic フォールバック ────────────────────────
+        if not printers:
+            try:
+                r = subprocess.run(
+                    "wmic printer get Name,DriverName,PortName,Default,Shared,PrinterStatus /value",
+                    capture_output=True, text=True, timeout=20, shell=True
+                )
+                cur = {}
+                def flush(c):
+                    if c.get("プリンター名"):
+                        printers.append(c)
+                for raw in r.stdout.splitlines():
+                    raw = raw.strip()
+                    if not raw:
+                        flush(cur); cur = {}
+                        continue
+                    if "=" not in raw:
+                        continue
+                    k, v = raw.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if not v:
+                        continue
+                    if k == "Name":
+                        cur["プリンター名"] = v
+                    elif k == "DriverName":
+                        cur["ドライバー"] = v
+                    elif k == "PortName":
+                        cur["ポート"] = v
+                    elif k == "Default":
+                        cur["既定"] = "はい" if v.upper() == "TRUE" else "いいえ"
+                    elif k == "Shared":
+                        cur["共有"] = "はい" if v.upper() == "TRUE" else "いいえ"
+                    elif k == "PrinterStatus":
+                        cur["状態"] = STATUS_MAP.get(v, v)
+                flush(cur)
+            except Exception:
+                pass
+
+    elif sys_name == "Darwin":
+        # lpstat でプリンター一覧
+        lp_out = run_command(["lpstat", "-p", "-d"])
+        current_name = None
+        for line in lp_out.splitlines():
+            line = line.strip()
+            if line.startswith("printer "):
+                parts = line.split()
+                current_name = parts[1] if len(parts) > 1 else line
+                status = "待機中"
+                if "is idle" in line:
+                    status = "待機中"
+                elif "is busy" in line or "printing" in line:
+                    status = "印刷中"
+                elif "disabled" in line:
+                    status = "無効"
+                printers.append({"プリンター名": current_name, "状態": status})
+            elif line.startswith("system default destination:"):
+                default_name = line.split(":", 1)[1].strip()
+                for p in printers:
+                    if p["プリンター名"] == default_name:
+                        p["既定"] = "はい"
+
+        # lpinfo でドライバー情報を補完
+        lpinfo_out = run_command(["lpinfo", "-l", "-v"])
+        for p in printers:
+            detail_out = run_command(["lpoptions", "-p", p["プリンター名"], "-l"])
+            if detail_out:
+                p["オプション数"] = f"{len(detail_out.splitlines())} 項目"
+
+    elif sys_name == "Linux":
+        lp_out = run_command(["lpstat", "-p", "-d"])
+        for line in lp_out.splitlines():
+            line = line.strip()
+            if line.startswith("printer "):
+                parts = line.split()
+                name = parts[1] if len(parts) > 1 else ""
+                status = "待機中"
+                if "is idle" in line:
+                    status = "待機中"
+                elif "printing" in line:
+                    status = "印刷中"
+                elif "disabled" in line or "stopped" in line:
+                    status = "停止"
+                printers.append({"プリンター名": name, "状態": status})
+            elif line.startswith("system default destination:"):
+                default_name = line.split(":", 1)[1].strip()
+                for p in printers:
+                    if p["プリンター名"] == default_name:
+                        p["既定"] = "はい"
+
+        # CUPS URI も取得
+        for p in printers:
+            uri_out = run_command(["lpstat", "-v", p["プリンター名"]])
+            if uri_out and ":" in uri_out:
+                parts = uri_out.split(":", 2)
+                if len(parts) >= 3:
+                    p["URI"] = parts[2].strip()
+
+    if not printers:
+        printers.append({"備考": "プリンターが見つかりませんでした"})
+
+    return printers
+
+
+def get_installed_apps():
+    """インストール済みアプリ一覧を返す。戻り値: list of dict"""
+    apps = []
+    sys_name = platform.system()
+
+    if sys_name == "Darwin":
+        # /Applications 以下の .app を列挙
+        app_dirs = ["/Applications", os.path.expanduser("~/Applications")]
+        seen = set()
+        for base in app_dirs:
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base)):
+                if not name.endswith(".app"):
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                display = name[:-4]
+                info_plist = os.path.join(base, name, "Contents", "Info.plist")
+                version = ""
+                try:
+                    # plutil で plist をパース
+                    out = run_command(["plutil", "-extract", "CFBundleShortVersionString",
+                                       "raw", "-o", "-", info_plist])
+                    version = out.strip() if out else ""
+                except Exception:
+                    pass
+                apps.append({"アプリ名": display, "バージョン": version,
+                             "場所": base})
+
+    elif sys_name == "Linux":
+        # dpkg (Debian/Ubuntu 系)
+        dpkg_out = run_command(["dpkg-query", "-W",
+                                "-f=${Package}\t${Version}\t${Status}\n"])
+        if dpkg_out:
+            for line in dpkg_out.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3 and "installed" in parts[2]:
+                    apps.append({"パッケージ名": parts[0],
+                                 "バージョン": parts[1],
+                                 "管理": "dpkg"})
+        # rpm (RHEL/Fedora/CentOS 系)
+        if not apps:
+            rpm_out = run_command(["rpm", "-qa", "--queryformat",
+                                   "%{NAME}\t%{VERSION}-%{RELEASE}\n"])
+            if rpm_out:
+                for line in rpm_out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        apps.append({"パッケージ名": parts[0],
+                                     "バージョン": parts[1],
+                                     "管理": "rpm"})
+        # flatpak
+        fp_out = run_command(["flatpak", "list", "--app",
+                              "--columns=application,version"])
+        if fp_out:
+            for line in fp_out.splitlines():
+                parts = line.split("\t")
+                if parts:
+                    apps.append({"パッケージ名": parts[0],
+                                 "バージョン": parts[1] if len(parts) > 1 else "",
+                                 "管理": "flatpak"})
+
+    elif sys_name == "Windows":
+        # PowerShell スクリプトを一時ファイルに書き出して実行
+        # （インライン -Command は長いスクリプトで構文エラーになりやすいため）
+        import tempfile, sys as _sys
+        ps_script = r"""
+$paths = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+$seen = @{}
+foreach ($p in $paths) {
+    $items = Get-ItemProperty $p -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+        $name = $item.DisplayName
+        if (-not $name -or $name -eq '') { continue }
+        if ($seen[$name]) { continue }
+        $seen[$name] = 1
+        $ver = if ($item.DisplayVersion) { $item.DisplayVersion } else { '' }
+        $pub = if ($item.Publisher)      { $item.Publisher }      else { '' }
+        $dat = if ($item.InstallDate)    { $item.InstallDate }    else { '' }
+        # タブ区切りで出力（アプリ名に | が含まれる場合も安全）
+        Write-Output ("{0}`t{1}`t{2}`t{3}" -f $name, $ver, $pub, $dat)
+    }
+}
+"""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1',
+                                             delete=False, encoding='utf-8') as tf:
+                tf.write(ps_script)
+                tmp_path = tf.name
+
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", tmp_path],
+                capture_output=True, text=True, timeout=60
+            )
+            lines = result.stdout.splitlines()
+            # 名前でソート
+            lines.sort(key=lambda x: x.lower())
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                entry = {"アプリ名": parts[0]}
+                if len(parts) > 1 and parts[1].strip():
+                    entry["バージョン"] = parts[1].strip()
+                if len(parts) > 2 and parts[2].strip():
+                    entry["発行元"] = parts[2].strip()
+                if len(parts) > 3 and parts[3].strip():
+                    raw = parts[3].strip()
+                    # YYYYMMDD → YYYY/MM/DD に整形
+                    if len(raw) == 8 and raw.isdigit():
+                        raw = f"{raw[:4]}/{raw[4:6]}/{raw[6:]}"
+                    entry["インストール日"] = raw
+                apps.append(entry)
+        except Exception:
+            pass
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    if not apps:
+        apps.append({"備考": "アプリ情報を取得できませんでした"})
+
+    return apps
+
+
 def get_network_info():
     """
     各ネットワークインターフェースの情報を返す。
@@ -849,7 +1200,7 @@ class PCSpecApp(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=0, pady=0)
 
-        tab_names = ["機種情報", "OS", "CPU", "メモリ", "ストレージ", "GPU", "ネットワーク"]
+        tab_names = ["機種情報", "OS", "CPU", "メモリ", "ストレージ", "GPU", "ネットワーク", "プリンター", "インストール済みアプリ"]
         self.tabs = {}
         for name in tab_names:
             frame = ttk.Frame(self.nb)
@@ -906,6 +1257,16 @@ class PCSpecApp(tk.Tk):
         net_data = get_network_info()
         self._spec_data["ネットワーク"] = net_data
         self.after(0, lambda: self._render_network(self.tabs["ネットワーク"], net_data))
+
+        self._update_status("プリンター情報を取得中...")
+        printer_data = get_printer_info()
+        self._spec_data["プリンター"] = printer_data
+        self.after(0, lambda: self._render_printers(self.tabs["プリンター"], printer_data))
+
+        self._update_status("インストール済みアプリを取得中...")
+        apps_data = get_installed_apps()
+        self._spec_data["インストール済みアプリ"] = apps_data
+        self.after(0, lambda: self._render_apps(self.tabs["インストール済みアプリ"], apps_data))
 
         self._update_status("完了")
         self.after(0, lambda: self.csv_btn.config(state="normal"))
@@ -1093,22 +1454,27 @@ class PCSpecApp(tk.Tk):
                 "CPU": "⚡ CPU",      "メモリ": "🧠 メモリ",
                 "ストレージ": "💾 ストレージ", "GPU": "🎮 GPU",
                 "ネットワーク": "🌐 ネットワーク",
+                "インストール済みアプリ": "📦 インストール済みアプリ",
+                "プリンター": "🖨 プリンター",
             }
             tab_colors = {
                 "機種情報": "17375E", "OS": "375623", "CPU": "7B3F00",
                 "メモリ": "4A235A", "ストレージ": "78290F",
                 "GPU": "1C3A5E", "ネットワーク": "1A472A",
+                "インストール済みアプリ": "5C3317",
+                "プリンター": "3D1A78",
             }
 
             # ═══════════════════════════════════════════
             # ① サマリーシート
             # ═══════════════════════════════════════════
             ws_s = make_sheet("📋 サマリー", "17375E")
+            SNC = 3  # サマリーは3列固定
             set_col_widths(ws_s, [20, 28, 42])
 
-            row = draw_title_bar(ws_s, 1, "🖥  PC SPEC CHECKER  ─  スペック一覧")
-            row = draw_info_bar(ws_s, row)
-            row = draw_empty(ws_s, row)
+            row = draw_title_bar(ws_s, 1, "🖥  PC SPEC CHECKER  ─  スペック一覧", ncols=SNC)
+            row = draw_info_bar(ws_s, row,                                          ncols=SNC)
+            row = draw_empty(ws_s, row,                                             ncols=SNC)
             row = draw_col_header(ws_s, row, ["カテゴリ", "項目", "値"])
             freeze(ws_s, f"A{row}")
 
@@ -1151,34 +1517,88 @@ class PCSpecApp(tk.Tk):
             # ② カテゴリ別シート
             # ═══════════════════════════════════════════
             for cat, data in self._spec_data.items():
-                icon  = cat_icons.get(cat, cat)
+                icon   = cat_icons.get(cat, cat)
                 tcolor = tab_colors.get(cat, "17375E")
-                ws = make_sheet(icon, tcolor)
-                set_col_widths(ws, [30, 45, 0])  # C列は非表示（merge先）
+                ws     = make_sheet(icon, tcolor)
 
-                r = draw_title_bar(ws, 1, icon)
-                r = draw_info_bar(ws, r)
-                r = draw_empty(ws, r)
-
+                # ── dict 系（OS/CPU/メモリ/機種情報）: 2列構成（項目・値）
                 if isinstance(data, dict):
-                    r = draw_section_header(ws, r, cat)
+                    NC = 2
+                    set_col_widths(ws, [30, 50])
+                    r = draw_title_bar(ws, 1, icon, ncols=NC)
+                    r = draw_info_bar(ws, r,         ncols=NC)
+                    r = draw_empty(ws, r,             ncols=NC)
+                    r = draw_section_header(ws, r, cat, ncols=NC)
                     r = draw_col_header(ws, r, ["項目", "値"])
                     for i, (k, v) in enumerate(data.items()):
-                        r = draw_kv(ws, r, k, v, i)
+                        r = draw_kv(ws, r, k, v, i, ncols=NC)
                     freeze(ws, f"A{r - len(data)}")
 
                 elif isinstance(data, list):
-                    r = draw_col_header(ws, r, ["項目", "値"])
-                    freeze(ws, f"A{r}")
-                    for item in data:
-                        if not isinstance(item, dict):
-                            continue
-                        sub = (item.get("マウント") or item.get("GPU名")
-                               or item.get("インターフェース") or item.get("備考") or "")
-                        r = draw_sub_header(ws, r, sub or cat)
-                        for i, (k, v) in enumerate(item.items()):
-                            r = draw_kv(ws, r, k, v, i)
-                        r = draw_empty(ws, r)
+                    if cat == "インストール済みアプリ":
+                        # アプリは多列テーブル形式
+                        priority = ["アプリ名", "パッケージ名", "バージョン",
+                                    "発行元", "インストール日", "管理", "場所"]
+                        present = set()
+                        for item in data:
+                            if isinstance(item, dict):
+                                present |= set(item.keys())
+                        present.discard("備考")
+                        app_cols = ([c for c in priority if c in present] +
+                                    [c for c in present if c not in priority])
+                        NC = len(app_cols)
+                        col_w = {"アプリ名": 40, "パッケージ名": 40,
+                                 "バージョン": 16, "発行元": 28,
+                                 "インストール日": 14, "管理": 10, "場所": 20}
+                        set_col_widths(ws, [col_w.get(c, 18) for c in app_cols])
+                        r = draw_title_bar(ws, 1, icon, ncols=NC)
+                        r = draw_info_bar(ws, r,         ncols=NC)
+                        r = draw_empty(ws, r,             ncols=NC)
+                        # 列ヘッダー
+                        for ci, h in enumerate(app_cols, 1):
+                            hc = ws.cell(row=r, column=ci, value=h)
+                            hc.fill = Fill(C["hdr_bg"])
+                            hc.font = F(C["hdr_fg"], bold=True, size=10)
+                            hc.alignment = Al(h="center")
+                            hc.border = Bdr(C["hdr_bg"])
+                        ws.row_dimensions[r].height = 22
+                        freeze(ws, f"A{r + 1}")
+                        r += 1
+                        # データ行
+                        for ai, item in enumerate(data):
+                            if not isinstance(item, dict):
+                                continue
+                            bg = C["odd_bg"] if ai % 2 == 0 else C["even_bg"]
+                            for ci, col in enumerate(app_cols, 1):
+                                val = str(item.get(col, "")) if item.get(col) else "—"
+                                c = ws.cell(row=r, column=ci, value=val)
+                                c.fill = Fill(bg)
+                                c.font = F(C["val_fg"] if ci > 1 else C["sum_cat"],
+                                           bold=(ci == 1), size=9)
+                                c.alignment = Al(indent=1)
+                                c.border = Bdr()
+                            ws.row_dimensions[r].height = 16
+                            r += 1
+
+                    else:
+                        # ストレージ / GPU / ネットワーク / プリンター: 2列構成
+                        NC = 2
+                        set_col_widths(ws, [30, 50])
+                        r = draw_title_bar(ws, 1, icon, ncols=NC)
+                        r = draw_info_bar(ws, r,         ncols=NC)
+                        r = draw_empty(ws, r,             ncols=NC)
+                        r = draw_col_header(ws, r, ["項目", "値"])
+                        freeze(ws, f"A{r}")
+                        for item in data:
+                            if not isinstance(item, dict):
+                                continue
+                            sub = (item.get("マウント") or item.get("GPU名")
+                                   or item.get("プリンター名")
+                                   or item.get("インターフェース") or item.get("備考") or "")
+                            r = draw_sub_header(ws, r, sub or cat, ncols=NC)
+                            for i, (k, v) in enumerate(item.items()):
+                                r = draw_kv(ws, r, k, v, i, ncols=NC)
+                            r = draw_empty(ws, r, ncols=NC)
 
             wb.save(path)
             messagebox.showinfo("Excel出力完了", "スペック情報を保存しました。\n\n" + path)
@@ -1430,6 +1850,172 @@ class PCSpecApp(tk.Tk):
                              font=self.font_val, anchor="w").pack(side="left", pady=5)
                 else:
                     self._kv_row(frame, k, v, alt=(i % 2 == 1))
+
+
+    def _render_printers(self, tab, printers: list):
+        """プリンター一覧を表示"""
+        frame = self._scrollable(tab)
+
+        if not printers or (len(printers) == 1 and "備考" in printers[0]):
+            self._section_label(frame, "プリンター")
+            tk.Label(frame, text="プリンターが見つかりませんでした",
+                     bg=BG, fg=TEXT_SUB, font=self.font_label).pack(padx=32, pady=16)
+            return
+
+        self._section_label(frame, f"プリンター ({len(printers)} 台)")
+
+        for i, p in enumerate(printers):
+            name = p.get("プリンター名", f"プリンター #{i+1}")
+            is_default = p.get("既定", "") == "はい"
+
+            # プリンターカード
+            card_bg = "#0d1a2e" if i % 2 == 0 else "#111b30"
+            card = tk.Frame(frame, bg=card_bg, pady=2)
+            card.pack(fill="x", padx=16, pady=4)
+
+            # タイトル行
+            title_f = tk.Frame(card, bg=card_bg)
+            title_f.pack(fill="x", padx=12, pady=(8, 4))
+
+            icon = "🖨"
+            title_text = f"{icon}  {name}"
+            if is_default:
+                title_text += "  ★ 既定"
+            tk.Label(title_f, text=title_text,
+                     bg=card_bg, fg=ACCENT if is_default else TEXT_MAIN,
+                     font=self.font_head).pack(side="left")
+
+            # 詳細情報
+            detail_f = tk.Frame(card, bg=card_bg)
+            detail_f.pack(fill="x", padx=24, pady=(0, 8))
+            skip = {"プリンター名", "既定"}
+            for j, (k, v) in enumerate(p.items()):
+                if k in skip or not v:
+                    continue
+                row = tk.Frame(detail_f, bg=card_bg)
+                row.pack(fill="x", pady=1)
+                # 状態に色付け
+                if k == "状態":
+                    col = GREEN if "待機" in v else YELLOW if "印刷中" in v else RED
+                else:
+                    col = TEXT_VAL
+                tk.Label(row, text=k, bg=card_bg, fg=TEXT_SUB,
+                         font=self.font_label, width=18, anchor="w").pack(side="left")
+                tk.Label(row, text=v, bg=card_bg, fg=col,
+                         font=self.font_val, anchor="w").pack(side="left")
+
+    def _render_apps(self, tab, apps: list):
+        """インストール済みアプリをリスト＋検索ボックスで表示"""
+        # 外枠
+        outer = tk.Frame(tab, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        # ── 検索バー ──
+        search_bar = tk.Frame(outer, bg=PANEL, pady=6)
+        search_bar.pack(fill="x", side="top")
+
+        tk.Label(search_bar, text="🔍  検索:", bg=PANEL,
+                 fg=TEXT_SUB, font=self.font_label).pack(side="left", padx=(16, 4))
+        search_var = tk.StringVar()
+        entry = tk.Entry(search_bar, textvariable=search_var,
+                         bg="#1e2433", fg=TEXT_MAIN, insertbackground=TEXT_MAIN,
+                         font=self.font_val, relief="flat", width=32)
+        entry.pack(side="left", padx=4, ipady=4)
+
+        count_lbl = tk.Label(search_bar, text="", bg=PANEL,
+                             fg=TEXT_SUB, font=self.font_small)
+        count_lbl.pack(side="left", padx=12)
+
+        # ── テーブル (Treeview) ──
+        cols = self._app_columns(apps)
+        tree_frame = tk.Frame(outer, bg=BG)
+        tree_frame.pack(fill="both", expand=True)
+
+        style = ttk.Style()
+        style.configure("Apps.Treeview",
+            background=BG, fieldbackground=BG,
+            foreground=TEXT_VAL, rowheight=22,
+            font=self.font_val, borderwidth=0)
+        style.configure("Apps.Treeview.Heading",
+            background=PANEL, foreground=ACCENT,
+            font=self.font_head, relief="flat")
+        style.map("Apps.Treeview",
+            background=[("selected", "#1e2d4a")],
+            foreground=[("selected", ACCENT)])
+
+        tv = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                          style="Apps.Treeview")
+
+        # カラム幅設定
+        col_widths = {"アプリ名": 280, "パッケージ名": 280,
+                      "バージョン": 120, "発行元": 180,
+                      "インストール日": 110, "管理": 80, "場所": 160}
+        for col in cols:
+            w = col_widths.get(col, 140)
+            tv.heading(col, text=col,
+                       command=lambda c=col: self._sort_tree(tv, c, False))
+            tv.column(col, width=w, anchor="w", minwidth=60)
+
+        # スクロールバー
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tv.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        # 行データを挿入
+        all_rows = []
+        for app in apps:
+            row_vals = tuple(str(app.get(c, "")) for c in cols)
+            all_rows.append(row_vals)
+
+        def populate(rows):
+            tv.delete(*tv.get_children())
+            for i, vals in enumerate(rows):
+                tag = "odd" if i % 2 == 0 else "even"
+                tv.insert("", "end", values=vals, tags=(tag,))
+            tv.tag_configure("odd",  background="#0d1525")
+            tv.tag_configure("even", background="#111b30")
+            count_lbl.config(
+                text=f"{len(rows)} / {len(all_rows)} 件")
+
+        populate(all_rows)
+
+        # 検索フィルター
+        def on_search(*_):
+            q = search_var.get().lower()
+            if not q:
+                populate(all_rows)
+            else:
+                filtered = [r for r in all_rows
+                            if any(q in str(v).lower() for v in r)]
+                populate(filtered)
+
+        search_var.trace_add("write", on_search)
+
+    def _app_columns(self, apps):
+        """実際に値がある列だけを返す"""
+        priority = ["アプリ名", "パッケージ名", "バージョン",
+                    "発行元", "インストール日", "管理", "場所"]
+        present = set()
+        for app in apps:
+            present |= set(app.keys())
+        present.discard("備考")
+        return [c for c in priority if c in present] +                [c for c in present if c not in priority]
+
+    def _sort_tree(self, tv, col, reverse):
+        """Treeview の列ヘッダークリックでソート"""
+        rows = [(tv.set(k, col), k) for k in tv.get_children("")]
+        rows.sort(reverse=reverse,
+                  key=lambda x: x[0].lower() if x[0] else "")
+        for i, (_, k) in enumerate(rows):
+            tv.move(k, "", i)
+            tag = "odd" if i % 2 == 0 else "even"
+            tv.item(k, tags=(tag,))
+        tv.heading(col, command=lambda: self._sort_tree(tv, col, not reverse))
 
 
 def main():
