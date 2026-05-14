@@ -205,6 +205,81 @@ def get_disk_info():
     return disks
 
 
+def _ping(ip: str, timeout_ms: int = 300) -> bool:
+    """単一IPへのping（Windows/macOS/Linux対応）"""
+    sys_name = platform.system()
+    timeout_s = max(1, timeout_ms // 1000) if timeout_ms >= 1000 else 1
+    try:
+        if sys_name == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout_s + 2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _get_arp_table() -> dict:
+    """
+    ARPキャッシュから {IP: (MAC, vendor)} を返す。
+    vendorはOUIの先頭3オクテットから簡易判定。
+    """
+    table = {}
+    sys_name = platform.system()
+    try:
+        if sys_name == "Windows":
+            r = subprocess.run(["arp", "-a"], capture_output=True,
+                               text=True, timeout=10, shell=True)
+            for line in r.stdout.splitlines():
+                # "  192.168.1.1          aa-bb-cc-dd-ee-ff     動的"
+                parts = line.split()
+                if len(parts) >= 2:
+                    ip_part  = parts[0]
+                    mac_part = parts[1]
+                    if re.match(r"\d+\.\d+\.\d+\.\d+", ip_part) and                        re.match(r"([0-9a-f]{2}[-:]){5}[0-9a-f]{2}", mac_part, re.I):
+                        mac = mac_part.replace("-", ":").upper()
+                        table[ip_part] = (mac, _oui_vendor(mac))
+        else:
+            r = subprocess.run(["arp", "-n"], capture_output=True,
+                               text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    ip_part  = parts[0]
+                    mac_part = parts[2]
+                    if re.match(r"\d+\.\d+\.\d+\.\d+", ip_part) and                        re.match(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac_part, re.I):
+                        mac = mac_part.upper()
+                        table[ip_part] = (mac, _oui_vendor(mac))
+    except Exception:
+        pass
+    return table
+
+
+# 簡易OUIベンダーテーブル（代表的なもの）
+_OUI_TABLE = {
+    "00:50:56": "VMware",     "00:0C:29": "VMware",
+    "08:00:27": "VirtualBox", "52:54:00": "QEMU/KVM",
+    "AC:DE:48": "Apple",      "00:1C:42": "Parallels",
+    "B8:27:EB": "Raspberry Pi","DC:A6:32": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi","28:CD:C1": "Apple",
+    "3C:22:FB": "Apple",      "F0:18:98": "Apple",
+    "00:1A:11": "Google",     "54:60:09": "Google",
+    "00:1B:44": "SanDisk",    "00:23:AE": "Dell",
+    "14:18:77": "Dell",       "F8:DB:88": "Dell",
+    "00:26:B9": "Dell",       "3C:A9:F4": "Intel",
+    "00:1E:67": "Intel",      "8C:8D:28": "Intel",
+    "00:E0:4C": "Realtek",    "00:11:32": "Synology",
+    "00:08:9B": "IODATA",     "00:A0:DE": "IODATA",
+    "00:10:18": "Buffalo",    "00:1D:73": "Buffalo",
+    "00:17:9A": "Buffalo",    "7C:DD:90": "Buffalo",
+}
+
+def _oui_vendor(mac: str) -> str:
+    prefix = mac[:8]
+    return _OUI_TABLE.get(prefix, "")
+
+
 def get_printer_info():
     """インストール済みプリンター一覧を返す。戻り値: list of dict"""
     printers = []
@@ -1155,6 +1230,16 @@ class PCSpecApp(tk.Tk):
             font=self.font_title
         ).pack(side="left", padx=24, pady=14)
 
+        self.scan_btn = tk.Button(
+            header, text="🔍 LAN スキャン",
+            bg="#7B3F00", fg=TEXT_MAIN,
+            font=self.font_small,
+            relief="flat", padx=12, pady=4,
+            cursor="hand2",
+            command=self._open_lan_scanner,
+        )
+        self.scan_btn.pack(side="right", padx=(0, 4), pady=14)
+
         self.xlsx_btn = tk.Button(
             header, text="📊 Excel出力",
             bg="#1d6f42", fg=TEXT_MAIN,
@@ -1286,6 +1371,452 @@ class PCSpecApp(tk.Tk):
             parts.append(safe_ser)
         parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
         return "_".join(parts)
+
+    def _open_lan_scanner(self):
+        """LANスキャンウィンドウを開く"""
+        import ipaddress, socket, concurrent.futures, time
+
+        win = tk.Toplevel(self)
+        win.title("LAN スキャン")
+        win.configure(bg=BG)
+        win.geometry("900x620")
+        win.minsize(700, 450)
+
+        # ── ツールバー ───────────────────────────────────────
+        toolbar = tk.Frame(win, bg=PANEL, pady=6)
+        toolbar.pack(fill="x", side="top")
+
+        tk.Label(toolbar, text="対象ネットワーク:", bg=PANEL,
+                 fg=TEXT_SUB, font=self.font_label).pack(side="left", padx=(12, 4))
+
+        # 自 PC の IPv4 から CIDR を自動推定
+        default_cidr = "192.168.1.0/24"
+        try:
+            if HAS_PSUTIL:
+                import psutil as _ps
+                for iface, addrs in _ps.net_if_addrs().items():
+                    for a in addrs:
+                        if a.family.name == "AF_INET" and not a.address.startswith("127."):
+                            ip = ipaddress.IPv4Address(a.address)
+                            mask = a.netmask or "255.255.255.0"
+                            net = ipaddress.IPv4Network(f"{a.address}/{mask}", strict=False)
+                            default_cidr = str(net)
+                            raise StopIteration
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+
+        cidr_var = tk.StringVar(value=default_cidr)
+        cidr_entry = tk.Entry(toolbar, textvariable=cidr_var,
+                              bg="#1e2433", fg=TEXT_MAIN, insertbackground=TEXT_MAIN,
+                              font=self.font_val, relief="flat", width=20)
+        cidr_entry.pack(side="left", padx=4, ipady=4)
+
+        timeout_var = tk.StringVar(value="300")
+        tk.Label(toolbar, text="タイムアウト(ms):", bg=PANEL,
+                 fg=TEXT_SUB, font=self.font_label).pack(side="left", padx=(12, 4))
+        tk.Entry(toolbar, textvariable=timeout_var,
+                 bg="#1e2433", fg=TEXT_MAIN, insertbackground=TEXT_MAIN,
+                 font=self.font_val, relief="flat", width=6).pack(side="left", ipady=4)
+
+        progress_lbl = tk.Label(toolbar, text="", bg=PANEL,
+                                fg=TEXT_SUB, font=self.font_small)
+        progress_lbl.pack(side="left", padx=16)
+
+        # ── テーブル ─────────────────────────────────────────
+        cols = ["IPアドレス", "ホスト名", "MACアドレス", "メーカー", "状態"]
+        style = ttk.Style()
+        style.configure("Scan.Treeview",
+            background=BG, fieldbackground=BG,
+            foreground=TEXT_VAL, rowheight=22,
+            font=self.font_val, borderwidth=0)
+        style.configure("Scan.Treeview.Heading",
+            background=PANEL, foreground=ACCENT,
+            font=self.font_head, relief="flat")
+        style.map("Scan.Treeview",
+            background=[("selected", "#1e2d4a")],
+            foreground=[("selected", ACCENT)])
+
+        table_frame = tk.Frame(win, bg=BG)
+        table_frame.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+
+        tv = ttk.Treeview(table_frame, columns=cols, show="headings",
+                          style="Scan.Treeview")
+        col_widths = {"IPアドレス": 130, "ホスト名": 200, "MACアドレス": 150,
+                      "メーカー": 180, "状態": 80}
+        for col in cols:
+            tv.heading(col, text=col,
+                       command=lambda c=col: self._sort_tree(tv, c, False))
+            tv.column(col, width=col_widths.get(col, 120), anchor="w", minwidth=60)
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical",   command=tv.yview)
+        hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=tv.xview)
+        tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        tv.tag_configure("up",      background="#0a1a10", foreground="#00e87a")
+        tv.tag_configure("down",    background="#1a0a0a", foreground="#6b7a99")
+        tv.tag_configure("self_pc", background="#0d1a2e", foreground="#00d4ff")
+
+        # ── フッター ─────────────────────────────────────────
+        footer = tk.Frame(win, bg=PANEL, pady=6)
+        footer.pack(fill="x", side="bottom")
+
+        count_lbl = tk.Label(footer, text="", bg=PANEL,
+                             fg=TEXT_SUB, font=self.font_small)
+        count_lbl.pack(side="left", padx=16)
+
+        export_xlsx_btn = tk.Button(footer, text="📊 Excel出力", bg="#1d6f42", fg=TEXT_MAIN,
+                                    font=self.font_small, relief="flat", padx=10, pady=3,
+                                    cursor="hand2", state="disabled",
+                                    command=lambda: self._export_scan_xlsx(tv, cols))
+        export_xlsx_btn.pack(side="right", padx=4)
+
+        export_btn = tk.Button(footer, text="📥 CSV出力", bg=ACCENT2, fg=TEXT_MAIN,
+                               font=self.font_small, relief="flat", padx=10, pady=3,
+                               cursor="hand2", state="disabled",
+                               command=lambda: self._export_scan_csv(tv, cols))
+        export_btn.pack(side="right", padx=4)
+
+        scan_btn_inner = tk.Button(footer, text="▶ スキャン開始",
+                                   bg=ACCENT, fg="#000000",
+                                   font=self.font_small, relief="flat",
+                                   padx=14, pady=3, cursor="hand2")
+        scan_btn_inner.pack(side="right", padx=4)
+
+        stop_flag = {"stop": False}
+
+        def do_scan():
+            stop_flag["stop"] = False
+            scan_btn_inner.config(text="⏹ 停止", command=do_stop,
+                                  bg=RED, fg=TEXT_MAIN)
+            export_btn.config(state="disabled")
+            tv.delete(*tv.get_children())
+            count_lbl.config(text="スキャン中...")
+
+            cidr_str = cidr_var.get().strip()
+            try:
+                timeout_ms = max(100, int(timeout_var.get()))
+            except ValueError:
+                timeout_ms = 300
+
+            try:
+                network = ipaddress.IPv4Network(cidr_str, strict=False)
+            except ValueError:
+                progress_lbl.config(text="CIDRが不正です")
+                scan_btn_inner.config(text="▶ スキャン開始", command=do_scan,
+                                      bg=ACCENT, fg="#000000")
+                return
+
+            hosts = list(network.hosts())
+            total = len(hosts)
+            found = [0]
+            done  = [0]
+
+            # ARP キャッシュを一度だけ取得（MACアドレス解決用）
+            arp_table = _get_arp_table()
+
+            # 自PCの IP → MAC マッピングを構築
+            self_ips = set()
+            self_ip_mac = {}   # {ip: (mac, vendor)}
+            try:
+                if HAS_PSUTIL:
+                    import psutil as _ps2
+                    import socket as _sock2
+                    AF_INET = _sock2.AF_INET
+                    MAC_FAM = {17}
+                    if hasattr(_ps2, "AF_LINK"):
+                        MAC_FAM.add(_ps2.AF_LINK)
+                    for addrs in _ps2.net_if_addrs().values():
+                        ipv4  = next((a.address for a in addrs if a.family == AF_INET
+                                      and not a.address.startswith("127.")), None)
+                        mac_r = next((a.address for a in addrs if a.family in MAC_FAM), None)
+                        if ipv4:
+                            self_ips.add(ipv4)
+                        if ipv4 and mac_r:
+                            mac_up = mac_r.replace("-", ":").upper()
+                            self_ip_mac[ipv4] = (mac_up, _oui_vendor(mac_up))
+                else:
+                    import uuid as _uuid, socket as _sock3
+                    raw = _uuid.getnode()
+                    mac_fb = ":".join(
+                        f"{(raw >> (8*i)) & 0xff:02X}" for i in reversed(range(6))
+                    )
+                    try:
+                        my_ip = _sock3.gethostbyname(_sock3.gethostname())
+                        self_ips.add(my_ip)
+                        self_ip_mac[my_ip] = (mac_fb, _oui_vendor(mac_fb))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            def ping_host(ip_obj):
+                if stop_flag["stop"]:
+                    return None
+                ip = str(ip_obj)
+                is_self = ip in self_ips
+                # 自PCはpingせずに確定で稼働中扱い
+                alive = True if is_self else _ping(ip, timeout_ms)
+                if not alive:
+                    return None
+                # ホスト名解決
+                try:
+                    hostname_r = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    hostname_r = ""
+                # MAC: 自PCはpsutilから、他はARPキャッシュから
+                if is_self and ip in self_ip_mac:
+                    mac, vendor = self_ip_mac[ip]
+                else:
+                    mac, vendor = arp_table.get(ip, ("", ""))
+                return (ip, hostname_r, mac, vendor, "自PC" if is_self else "稼働中", is_self)
+
+            def update_ui(result):
+                if result is None:
+                    return
+                ip, hostname_r, mac, vendor, status, is_self = result
+                found[0] += 1
+                tag = "self_pc" if is_self else "up"
+                tv.insert("", "end",
+                          values=(ip, hostname_r, mac, vendor, status),
+                          tags=(tag,))
+                # IPアドレス順にソート
+                items = [(tv.set(k, "IPアドレス"), k) for k in tv.get_children("")]
+                items.sort(key=lambda x: [int(p) for p in x[0].split(".") if p.isdigit()])
+                for i, (_, k) in enumerate(items):
+                    tv.move(k, "", i)
+
+            def worker():
+                max_workers = min(128, total)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(ping_host, ip): ip for ip in hosts}
+                    for fut in concurrent.futures.as_completed(futures):
+                        if stop_flag["stop"]:
+                            break
+                        done[0] += 1
+                        result = fut.result()
+                        if result:
+                            win.after(0, lambda r=result: update_ui(r))
+                        pct = int(done[0] / total * 100)
+                        win.after(0, lambda p=pct, d=done[0], t=total:
+                                  progress_lbl.config(
+                                      text=f"{d}/{t} ({p}%)"))
+
+                win.after(0, scan_finished)
+
+            def scan_finished():
+                scan_btn_inner.config(text="▶ スキャン開始", command=do_scan,
+                                      bg=ACCENT, fg="#000000")
+                up = found[0]
+                progress_lbl.config(text="完了")
+                count_lbl.config(text=f"稼働中: {up} 台 / スキャン: {total} アドレス")
+                export_btn.config(state="normal")
+                export_xlsx_btn.config(state="normal")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def do_stop():
+            stop_flag["stop"] = True
+            scan_btn_inner.config(text="▶ スキャン開始", command=do_scan,
+                                  bg=ACCENT, fg="#000000")
+            progress_lbl.config(text="停止しました")
+
+        scan_btn_inner.config(command=do_scan)
+
+    def _export_scan_csv(self, tv, cols):
+        """スキャン結果をCSVに出力"""
+        path = filedialog.asksaveasfilename(
+            title="スキャン結果の保存先",
+            defaultextension=".csv",
+            initialfile=f"lan_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            filetypes=[("CSVファイル", "*.csv"), ("すべてのファイル", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["出力日時", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow([])
+                writer.writerow(cols)
+                for iid in tv.get_children():
+                    writer.writerow(tv.item(iid, "values"))
+            messagebox.showinfo("完了", "スキャン結果を保存しました。\n\n" + path)
+        except Exception as e:
+            messagebox.showerror("エラー", str(e))
+
+    def _export_scan_xlsx(self, tv, cols):
+        """LANスキャン結果を書式付きExcelに出力"""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            if messagebox.askyesno(
+                "openpyxl が見つかりません",
+                "Excel出力には openpyxl が必要です。\n今すぐインストールしますか?\n\n  pip install openpyxl"
+            ):
+                import subprocess as _sp, sys as _sys
+                try:
+                    _sp.run([_sys.executable, "-m", "pip", "install", "openpyxl"], check=True)
+                    messagebox.showinfo("完了", "インストール完了。もう一度押してください。")
+                except Exception as e:
+                    messagebox.showerror("エラー", str(e))
+            return
+
+        default_name = f"lan_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Excelの保存先を選択",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excelファイル", "*.xlsx"), ("すべてのファイル", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            # ── スタイル定数 ────────────────────────────────
+            C = {
+                "title_bg": "17375E", "title_fg": "FFFFFF",
+                "info_bg":  "D6E4F0", "info_fg":  "17375E",
+                "hdr_bg":   "2E75B6", "hdr_fg":   "FFFFFF",
+                "odd_bg":   "FFFFFF", "even_bg":  "EBF3FB",
+                "up_bg":    "E8F5E9", "up_fg":    "1B5E20",
+                "self_bg":  "E3F2FD", "self_fg":  "0D47A1",
+                "val_fg":   "17375E", "bdr":      "B8CCE4",
+                "bdr_acc":  "2E75B6",
+            }
+            fn_name = "Yu Gothic UI" if platform.system() == "Windows" else "Helvetica Neue"
+
+            def F(color, bold=False, size=10):
+                return Font(name=fn_name, color=color, bold=bold, size=size)
+            def Fill(c):
+                return PatternFill("solid", fgColor=c)
+            def Al(h="left", v="center", wrap=False):
+                return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+            def full_border(ncols, ci, bg=None):
+                bc = C["bdr"]
+                l = Side(style="medium" if ci == 1      else "thin", color=bc)
+                r = Side(style="medium" if ci == ncols  else "thin", color=bc)
+                t = Side(style="thin",  color=bc)
+                b = Side(style="thin",  color=bc)
+                return Border(left=l, right=r, top=t, bottom=b)
+
+            def hdr_border(ncols, ci):
+                bc = C["bdr"]
+                l = Side(style="medium" if ci == 1     else "thin",   color=bc)
+                r = Side(style="medium" if ci == ncols else "thin",   color=bc)
+                t = Side(style="medium", color=bc)
+                b = Side(style="medium", color=C["bdr_acc"])
+                return Border(left=l, right=r, top=t, bottom=b)
+
+            # ── ワークブック作成 ─────────────────────────────
+            wb  = openpyxl.Workbook()
+            ws  = wb.active
+            ws.title = "🌐 LANスキャン結果"
+            ws.sheet_view.showGridLines = False
+            ws.sheet_properties.tabColor = "1A472A"
+
+            NC  = len(cols)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            hostname = platform.node() or "unknown"
+
+            # 列幅
+            col_w = {"IPアドレス": 16, "ホスト名": 28, "MACアドレス": 20,
+                     "メーカー": 24, "状態": 10}
+            for ci, col in enumerate(cols, 1):
+                ws.column_dimensions[get_column_letter(ci)].width = col_w.get(col, 18)
+
+            row = 1
+            # タイトル行
+            ws.merge_cells(f"A{row}:{get_column_letter(NC)}{row}")
+            tc = ws.cell(row=row, column=1, value="🌐  LAN スキャン結果")
+            tc.fill = Fill(C["title_bg"]); tc.font = F(C["title_fg"], bold=True, size=14)
+            tc.alignment = Al(h="center")
+            for ci in range(1, NC + 1):
+                cell = ws.cell(row=row, column=ci)
+                cell.fill = Fill(C["title_bg"])
+                l = Side(style="medium" if ci == 1  else "thin", color=C["title_bg"])
+                r = Side(style="medium" if ci == NC else "thin", color=C["title_bg"])
+                cell.border = Border(left=l, right=r,
+                                     top=Side(style="medium", color=C["title_bg"]),
+                                     bottom=Side(style="thin", color=C["bdr"]))
+            ws.row_dimensions[row].height = 38
+            row += 1
+
+            # PC情報・スキャン日時行
+            ws.merge_cells(f"A{row}:{get_column_letter(NC)}{row}")
+            rows_data = list(tv.get_children())
+            up_count  = sum(1 for iid in rows_data
+                            if tv.item(iid, "values")[4] in ("稼働中", "自PC"))
+            ic = ws.cell(row=row, column=1,
+                         value=f"  PC名: {hostname}  │  スキャン日時: {now}"
+                               f"  │  稼働ホスト: {up_count} 台 / {len(rows_data)} 件")
+            ic.fill = Fill(C["info_bg"]); ic.font = F(C["info_fg"], size=9)
+            ic.alignment = Al()
+            for ci in range(1, NC + 1):
+                cell = ws.cell(row=row, column=ci)
+                cell.fill = Fill(C["info_bg"])
+                l = Side(style="medium" if ci == 1  else "thin", color=C["bdr"])
+                r = Side(style="medium" if ci == NC else "thin", color=C["bdr"])
+                cell.border = Border(left=l, right=r,
+                                     top=Side(style="thin",   color=C["bdr"]),
+                                     bottom=Side(style="medium", color=C["bdr_acc"]))
+            ws.row_dimensions[row].height = 20
+            row += 1
+
+            # 空白行
+            ws.merge_cells(f"A{row}:{get_column_letter(NC)}{row}")
+            for ci in range(1, NC + 1):
+                ws.cell(row=row, column=ci).fill = Fill("FFFFFF")
+            ws.row_dimensions[row].height = 6
+            row += 1
+
+            # 列ヘッダー行
+            for ci, col in enumerate(cols, 1):
+                hc = ws.cell(row=row, column=ci, value=col)
+                hc.fill = Fill(C["hdr_bg"]); hc.font = F(C["hdr_fg"], bold=True, size=10)
+                hc.alignment = Al(h="center"); hc.border = hdr_border(NC, ci)
+            ws.row_dimensions[row].height = 22
+            ws.freeze_panes = f"A{row + 1}"
+            row += 1
+
+            # データ行
+            for idx, iid in enumerate(rows_data):
+                values = tv.item(iid, "values")
+                status = values[4] if len(values) > 4 else ""
+                if status == "自PC":
+                    bg = C["self_bg"]; fg = C["self_fg"]
+                else:
+                    bg = C["up_bg"]   if idx % 2 == 0 else C["even_bg"]
+                    fg = C["val_fg"]
+
+                for ci, val in enumerate(values, 1):
+                    cell = ws.cell(row=row, column=ci, value=val)
+                    cell.fill = Fill(bg)
+                    cell.font = F(fg, bold=(ci == 1), size=10)
+                    cell.alignment = Al()
+                    cell.border = full_border(NC, ci)
+                ws.row_dimensions[row].height = 18
+                row += 1
+
+            # オートフィルター
+            ws.auto_filter.ref = (
+                f"A4:{get_column_letter(NC)}{row - 1}"
+            )
+
+            wb.save(path)
+            messagebox.showinfo("Excel出力完了",
+                                "スキャン結果を保存しました。\n\n" + path)
+        except Exception as e:
+            messagebox.showerror("エラー", "Excel出力に失敗しました。\n\n" + str(e))
 
     def _export_xlsx(self):
         """全スペック情報を見やすい書式付き Excel ファイルに出力する"""
