@@ -256,28 +256,221 @@ def _get_arp_table() -> dict:
     return table
 
 
-# 簡易OUIベンダーテーブル（代表的なもの）
-_OUI_TABLE = {
-    "00:50:56": "VMware",     "00:0C:29": "VMware",
-    "08:00:27": "VirtualBox", "52:54:00": "QEMU/KVM",
-    "AC:DE:48": "Apple",      "00:1C:42": "Parallels",
-    "B8:27:EB": "Raspberry Pi","DC:A6:32": "Raspberry Pi",
-    "E4:5F:01": "Raspberry Pi","28:CD:C1": "Apple",
-    "3C:22:FB": "Apple",      "F0:18:98": "Apple",
-    "00:1A:11": "Google",     "54:60:09": "Google",
-    "00:1B:44": "SanDisk",    "00:23:AE": "Dell",
-    "14:18:77": "Dell",       "F8:DB:88": "Dell",
-    "00:26:B9": "Dell",       "3C:A9:F4": "Intel",
-    "00:1E:67": "Intel",      "8C:8D:28": "Intel",
-    "00:E0:4C": "Realtek",    "00:11:32": "Synology",
-    "00:08:9B": "IODATA",     "00:A0:DE": "IODATA",
-    "00:10:18": "Buffalo",    "00:1D:73": "Buffalo",
-    "00:17:9A": "Buffalo",    "7C:DD:90": "Buffalo",
+# ── OUI データベース ───────────────────────────────────────────────────
+# IEEEの公式OUIファイル（oui.txt）をダウンロード・キャッシュして使う。
+# ネットワーク不通時や初回起動時はフォールバックテーブルで補完。
+
+_OUI_DB: dict = {}
+_OUI_DB_LOADED = False
+
+_OUI_CACHE_PATH = os.path.join(
+    os.path.expanduser("~"), ".cache", "pc_spec_checker", "oui.csv"
+)
+
+_OUI_FALLBACK = {
+    "00:50:56": "VMware",      "00:0C:29": "VMware",
+    "08:00:27": "VirtualBox",  "52:54:00": "QEMU/KVM",
+    "00:1C:42": "Parallels",   "B8:27:EB": "Raspberry Pi Foundation",
+    "DC:A6:32": "Raspberry Pi Foundation", "E4:5F:01": "Raspberry Pi Trading",
+    "00:1A:11": "Google",      "54:60:09": "Google",
+    "00:23:AE": "Dell",        "14:18:77": "Dell",
+    "F8:DB:88": "Dell",        "00:26:B9": "Dell",
+    "3C:A9:F4": "Intel",       "00:1E:67": "Intel",
+    "8C:8D:28": "Intel",       "00:E0:4C": "Realtek",
+    "00:11:32": "Synology",    "00:08:9B": "I-O Data",
+    "00:A0:DE": "I-O Data",    "00:10:18": "Buffalo",
+    "00:1D:73": "Buffalo",     "7C:DD:90": "Buffalo",
+    "AC:DE:48": "Apple",       "28:CD:C1": "Apple",
+    "3C:22:FB": "Apple",       "F0:18:98": "Apple",
 }
 
+_OUI_TXT_URL = "https://standards-oui.ieee.org/oui/oui.txt"
+
+
+def _load_oui_db(on_status=None):
+    """OUIデータベースをキャッシュから読み込む（なければダウンロード）
+    on_status: 状態文字列を受け取るコールバック関数 (省略可)
+    キャッシュファイルが削除された場合は再ダウンロードする。
+    """
+    global _OUI_DB, _OUI_DB_LOADED
+
+    def notify(msg):
+        if on_status:
+            try:
+                on_status(msg)
+            except Exception:
+                pass
+
+    # ロード済みかつキャッシュが存在 → そのまま返す
+    cache_exists = os.path.isfile(_OUI_CACHE_PATH)
+    if _OUI_DB_LOADED and cache_exists:
+        notify("OUI DB: 読込済 ({:,} 件)".format(len(_OUI_DB)))
+        return
+
+    # ロード済みだがキャッシュが消えた → リセットして再取得
+    if _OUI_DB_LOADED and not cache_exists:
+        notify("OUI DB: キャッシュが見つかりません。再ダウンロードします...")
+        _OUI_DB.clear()
+        _OUI_DB_LOADED = False
+
+    # キャッシュが存在すれば読み込む
+    if os.path.isfile(_OUI_CACHE_PATH):
+        notify("OUI DB: キャッシュを読み込み中...")
+        try:
+            loaded = {}
+            with open(_OUI_CACHE_PATH, "r", encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(",", 1)
+                    if len(parts) == 2:
+                        loaded[parts[0].upper()] = parts[1]
+            if loaded:
+                _OUI_DB.update(loaded)
+                _OUI_DB_LOADED = True
+                notify("OUI DB: 読込完了 ({:,} 件)".format(len(_OUI_DB)))
+                return
+        except Exception as ex:
+            notify("OUI DB: キャッシュ読込失敗 ({}) → 再ダウンロード".format(ex))
+            _OUI_DB.clear()
+
+    # ─── ダウンロード ───────────────────────────────────────────
+    # 複数URLを順に試す（フォールバック付き）
+    OUI_URLS = [
+        ("IEEE oui.txt",        "https://standards-oui.ieee.org/oui/oui.txt"),
+        ("IEEE oui.csv",        "https://standards-oui.ieee.org/oui/oui.csv"),
+        ("Wireshark GitHub",    "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"),
+        ("GitLab mirror",       "https://gitlab.com/wireshark/wireshark/-/raw/master/manuf"),
+        ("linuxnet.ca mirror",  "http://linuxnet.ca/ieee/oui.txt"),
+        ("coffer.com mirror",   "http://www.coffer.com/mac_find/oui.txt"),
+    ]
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/plain, */*",
+    }
+    # IEEE oui.txt 形式: "00-50-56   (hex)  VMware, Inc."
+    PAT_IEEE = re.compile(
+        r'^([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})\s+\(hex\)\s+(.+)$'
+    )
+    # IEEE oui.csv 形式: "MA-L","00-00-00","XEROX CORPORATION","..."
+    PAT_CSV = re.compile(
+        r'^"[^"]*","([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})","([^"]+)"'
+    )
+    # Wireshark manuf 形式: "00:50:56  VMware, Inc.  # comment"
+    PAT_MANUF = re.compile(
+        r'^([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})[ \t]+(\S[^\t#]+?)(?:[ \t]*#.*)?$'
+    )
+
+    import urllib.request as _ur
+
+    db = {}
+    success = False
+    for label, url in OUI_URLS:
+        notify("OUI DB: {} からダウンロード中...".format(label))
+        try:
+            os.makedirs(os.path.dirname(_OUI_CACHE_PATH), exist_ok=True)
+            tmp = _OUI_CACHE_PATH + ".tmp"
+
+            downloaded = [0]
+            def reporthook(bn, bs, ts, _dl=downloaded):
+                _dl[0] = bn * bs
+                if ts > 0:
+                    pct = min(100, int(_dl[0] / ts * 100))
+                    notify("OUI DB: ダウンロード中... {}%".format(pct))
+                else:
+                    notify("OUI DB: ダウンロード中... {} KB".format(_dl[0] // 1024))
+
+            req = _ur.Request(url, headers=HEADERS)
+            with _ur.urlopen(req, timeout=30) as resp,                  open(tmp, "wb") as tf:
+                block = 8192
+                total = int(resp.headers.get("Content-Length", 0))
+                recv = 0
+                blk_n = 0
+                while True:
+                    chunk = resp.read(block)
+                    if not chunk:
+                        break
+                    tf.write(chunk)
+                    recv += len(chunk)
+                    blk_n += 1
+                    reporthook(blk_n, block, total)
+
+            notify("OUI DB: 解析中...")
+            with open(tmp, "r", encoding="utf-8", errors="replace") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m = PAT_IEEE.match(line)
+                    if m:
+                        oui = m.group(1).replace("-", ":").upper()
+                        db[oui] = m.group(2).strip()
+                        continue
+                    m = PAT_CSV.match(line)
+                    if m:
+                        oui = m.group(1).replace("-", ":").upper()
+                        db[oui] = m.group(2).strip()
+                        continue
+                    m = PAT_MANUF.match(line)
+                    if m:
+                        oui = m.group(1).upper()
+                        db[oui] = m.group(2).strip()
+
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+            if db:
+                success = True
+                break
+            else:
+                notify("OUI DB: {} から0件 → 次のURLを試します".format(label))
+
+        except Exception as ex:
+            notify("OUI DB: {} 失敗 ({}) → 次を試します".format(label, ex))
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+    if success and db:
+        notify("OUI DB: キャッシュに保存中...")
+        try:
+            with open(_OUI_CACHE_PATH, "w", encoding="utf-8") as fp:
+                for k, v in db.items():
+                    fp.write(k + "," + v + "\n")
+        except Exception as ex:
+            notify("OUI DB: キャッシュ保存失敗 ({})".format(ex))
+
+        _OUI_DB.update(db)
+        _OUI_DB_LOADED = True
+        notify("OUI DB: 完了 ({:,} 件)".format(len(_OUI_DB)))
+    else:
+        # 全URL失敗: フォールバックテーブルで続行
+        _OUI_DB.update(_OUI_FALLBACK)
+        _OUI_DB_LOADED = True
+        notify("OUI DB: オフライン ({} 件のみ)".format(len(_OUI_FALLBACK)))
+
 def _oui_vendor(mac: str) -> str:
-    prefix = mac[:8]
-    return _OUI_TABLE.get(prefix, "")
+    """MACアドレス(XX:XX:XX:XX:XX:XX)からベンダー名を返す"""
+    # 未ロード or キャッシュが消えた場合は再ロード
+    if not _OUI_DB_LOADED or not os.path.isfile(_OUI_CACHE_PATH):
+        _load_oui_db()
+    prefix = mac[:8].upper().replace("-", ":")
+    return _OUI_DB.get(prefix, _OUI_FALLBACK.get(prefix, ""))
+
+
+def _ensure_oui_db_async(on_status=None):
+    """バックグラウンドでOUIデータベースを非同期ロードする
+    on_status: 状態文字列を受け取るコールバック関数 (省略可)
+    """
+    import threading as _th
+    _th.Thread(target=_load_oui_db, args=(on_status,), daemon=True).start()
 
 
 def get_printer_info():
@@ -1210,6 +1403,10 @@ class PCSpecApp(tk.Tk):
         self._setup_fonts()
         self._build_ui()
         self._load_data_async()
+        # OUIデータベースをバックグラウンドでロード開始（ステータスバーに進捗表示）
+        _ensure_oui_db_async(
+            on_status=lambda msg: self.after(0, lambda m=msg: self.status_lbl.config(text=m))
+        )
 
     def _setup_fonts(self):
         self.font_title  = ("Helvetica Neue", 22, "bold")
