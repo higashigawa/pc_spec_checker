@@ -288,9 +288,9 @@ _OUI_TXT_URL = "https://standards-oui.ieee.org/oui/oui.txt"
 
 
 def _load_oui_db(on_status=None):
-    """OUIデータベースをキャッシュから読み込む（なければダウンロード）
+    """OUIデータベースをキャッシュから読み込む（なければIEEEからダウンロード）
     on_status: 状態文字列を受け取るコールバック関数 (省略可)
-    キャッシュファイルが削除された場合は再ダウンロードする。
+    キャッシュが削除された場合は再ダウンロードする。
     """
     global _OUI_DB, _OUI_DB_LOADED
 
@@ -301,13 +301,11 @@ def _load_oui_db(on_status=None):
             except Exception:
                 pass
 
-    # ロード済みかつキャッシュが存在 → そのまま返す
+    # ロード済みでもキャッシュファイルが消えていたら再ロード
     cache_exists = os.path.isfile(_OUI_CACHE_PATH)
     if _OUI_DB_LOADED and cache_exists:
         notify("OUI DB: 読込済 ({:,} 件)".format(len(_OUI_DB)))
         return
-
-    # ロード済みだがキャッシュが消えた → リセットして再取得
     if _OUI_DB_LOADED and not cache_exists:
         notify("OUI DB: キャッシュが見つかりません。再ダウンロードします...")
         _OUI_DB.clear()
@@ -317,17 +315,15 @@ def _load_oui_db(on_status=None):
     if os.path.isfile(_OUI_CACHE_PATH):
         notify("OUI DB: キャッシュを読み込み中...")
         try:
-            loaded = {}
-            with open(_OUI_CACHE_PATH, "r", encoding="utf-8") as fp:
-                for line in fp:
+            with open(_OUI_CACHE_PATH, "r", encoding="utf-8") as f:
+                for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     parts = line.split(",", 1)
                     if len(parts) == 2:
-                        loaded[parts[0].upper()] = parts[1]
-            if loaded:
-                _OUI_DB.update(loaded)
+                        _OUI_DB[parts[0].upper()] = parts[1]
+            if _OUI_DB:
                 _OUI_DB_LOADED = True
                 notify("OUI DB: 読込完了 ({:,} 件)".format(len(_OUI_DB)))
                 return
@@ -335,126 +331,58 @@ def _load_oui_db(on_status=None):
             notify("OUI DB: キャッシュ読込失敗 ({}) → 再ダウンロード".format(ex))
             _OUI_DB.clear()
 
-    # ─── ダウンロード ───────────────────────────────────────────
-    # 複数URLを順に試す（フォールバック付き）
-    OUI_URLS = [
-        ("IEEE oui.txt",        "https://standards-oui.ieee.org/oui/oui.txt"),
-        ("IEEE oui.csv",        "https://standards-oui.ieee.org/oui/oui.csv"),
-        ("Wireshark GitHub",    "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"),
-        ("GitLab mirror",       "https://gitlab.com/wireshark/wireshark/-/raw/master/manuf"),
-        ("linuxnet.ca mirror",  "http://linuxnet.ca/ieee/oui.txt"),
-        ("coffer.com mirror",   "http://www.coffer.com/mac_find/oui.txt"),
-    ]
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/plain, */*",
-    }
-    # IEEE oui.txt 形式: "00-50-56   (hex)  VMware, Inc."
-    PAT_IEEE = re.compile(
-        r'^([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})\s+\(hex\)\s+(.+)$'
-    )
-    # IEEE oui.csv 形式: "MA-L","00-00-00","XEROX CORPORATION","..."
-    PAT_CSV = re.compile(
-        r'^"[^"]*","([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})","([^"]+)"'
-    )
-    # Wireshark manuf 形式: "00:50:56  VMware, Inc.  # comment"
-    PAT_MANUF = re.compile(
-        r'^([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})[ \t]+(\S[^\t#]+?)(?:[ \t]*#.*)?$'
-    )
+    # キャッシュなし → IEEE oui.txt をダウンロード
+    notify("OUI DB: IEEEからダウンロード中...")
+    try:
+        import urllib.request
+        downloaded = [0]
 
-    import urllib.request as _ur
-
-    db = {}
-    success = False
-    for label, url in OUI_URLS:
-        notify("OUI DB: {} からダウンロード中...".format(label))
-        try:
-            os.makedirs(os.path.dirname(_OUI_CACHE_PATH), exist_ok=True)
-            tmp = _OUI_CACHE_PATH + ".tmp"
-
-            downloaded = [0]
-            def reporthook(bn, bs, ts, _dl=downloaded):
-                _dl[0] = bn * bs
-                if ts > 0:
-                    pct = min(100, int(_dl[0] / ts * 100))
-                    notify("OUI DB: ダウンロード中... {}%".format(pct))
-                else:
-                    notify("OUI DB: ダウンロード中... {} KB".format(_dl[0] // 1024))
-
-            req = _ur.Request(url, headers=HEADERS)
-            with _ur.urlopen(req, timeout=30) as resp,                  open(tmp, "wb") as tf:
-                block = 8192
-                total = int(resp.headers.get("Content-Length", 0))
-                recv = 0
-                blk_n = 0
-                while True:
-                    chunk = resp.read(block)
-                    if not chunk:
-                        break
-                    tf.write(chunk)
-                    recv += len(chunk)
-                    blk_n += 1
-                    reporthook(blk_n, block, total)
-
-            notify("OUI DB: 解析中...")
-            with open(tmp, "r", encoding="utf-8", errors="replace") as fp:
-                for line in fp:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    m = PAT_IEEE.match(line)
-                    if m:
-                        oui = m.group(1).replace("-", ":").upper()
-                        db[oui] = m.group(2).strip()
-                        continue
-                    m = PAT_CSV.match(line)
-                    if m:
-                        oui = m.group(1).replace("-", ":").upper()
-                        db[oui] = m.group(2).strip()
-                        continue
-                    m = PAT_MANUF.match(line)
-                    if m:
-                        oui = m.group(1).upper()
-                        db[oui] = m.group(2).strip()
-
-            if os.path.exists(tmp):
-                os.remove(tmp)
-
-            if db:
-                success = True
-                break
+        def reporthook(block_num, block_size, total_size):
+            downloaded[0] = block_num * block_size
+            if total_size > 0:
+                pct = min(100, int(downloaded[0] / total_size * 100))
+                notify("OUI DB: ダウンロード中... {}%".format(pct))
             else:
-                notify("OUI DB: {} から0件 → 次のURLを試します".format(label))
+                kb = downloaded[0] // 1024
+                notify("OUI DB: ダウンロード中... {} KB".format(kb))
 
-        except Exception as ex:
-            notify("OUI DB: {} 失敗 ({}) → 次を試します".format(label, ex))
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
+        os.makedirs(os.path.dirname(_OUI_CACHE_PATH), exist_ok=True)
+        tmp = _OUI_CACHE_PATH + ".tmp"
+        urllib.request.urlretrieve(_OUI_TXT_URL, tmp, reporthook=reporthook)
 
-    if success and db:
+        notify("OUI DB: 解析中...")
+        db = {}
+        # IEEE oui.txt の書式: "00-50-56   (hex)  VMware, Inc."
+        ieee_pat = re.compile(
+            "^([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})"  # OUI
+            "[\t ]+"                                    # 空白
+            "[(]hex[)]"                                 # (hex)
+            "[\t ]+"                                    # 空白
+            "(.+)$"                                     # ベンダー名
+        )
+        with open(tmp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = ieee_pat.match(line.strip())
+                if m:
+                    oui = m.group(1).replace("-", ":").upper()
+                    db[oui] = m.group(2).strip()
+
         notify("OUI DB: キャッシュに保存中...")
-        try:
-            with open(_OUI_CACHE_PATH, "w", encoding="utf-8") as fp:
-                for k, v in db.items():
-                    fp.write(k + "," + v + "\n")
-        except Exception as ex:
-            notify("OUI DB: キャッシュ保存失敗 ({})".format(ex))
+        with open(_OUI_CACHE_PATH, "w", encoding="utf-8") as f:
+            for k, v in db.items():
+                f.write(k + "," + v + "\n")
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
         _OUI_DB.update(db)
         _OUI_DB_LOADED = True
         notify("OUI DB: 完了 ({:,} 件)".format(len(_OUI_DB)))
-    else:
-        # 全URL失敗: フォールバックテーブルで続行
+
+    except Exception as ex:
         _OUI_DB.update(_OUI_FALLBACK)
         _OUI_DB_LOADED = True
-        notify("OUI DB: オフライン ({} 件のみ)".format(len(_OUI_FALLBACK)))
+        notify("OUI DB: オフライン ({} 件のみ) [{}]".format(len(_OUI_FALLBACK), ex))
 
 def _oui_vendor(mac: str) -> str:
     """MACアドレス(XX:XX:XX:XX:XX:XX)からベンダー名を返す"""
@@ -1070,77 +998,98 @@ def get_machine_info():
             info["備考"] = "DMI情報を取得できませんでした (仮想環境または権限不足)"
 
     elif sys_name == "Windows":
-        # PowerShell で取得（WMIC は Windows 11 で廃止済み）
-        def ps(script):
-            """PowerShell ワンライナーを実行して結果を返す"""
-            try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive",
-                     "-Command", script],
-                    capture_output=True, text=True, timeout=15
-                )
-                return r.stdout.strip()
-            except Exception:
-                return ""
-
+        # PowerShell で一括取得（1回の起動で全情報を取得してタイムアウトを最小化）
+        import tempfile as _tf2
+        import os as _os2
+        ps_script = (
+            "$cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue\n"
+            "$bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue\n"
+            "$csp  = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue\n"
+            "if(-not $cs){$cs   = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue}\n"
+            "if(-not $bios){$bios = Get-WmiObject Win32_BIOS -ErrorAction SilentlyContinue}\n"
+            "if(-not $csp){$csp  = Get-WmiObject Win32_ComputerSystemProduct -ErrorAction SilentlyContinue}\n"
+            "Write-Output ('MANUFACTURER:' + $cs.Manufacturer)\n"
+            "Write-Output ('MODEL:'        + $cs.Model)\n"
+            "Write-Output ('FAMILY:'       + $cs.SystemFamily)\n"
+            "Write-Output ('SERIAL:'       + $bios.SerialNumber)\n"
+            "Write-Output ('BIOSVER:'      + $bios.SMBIOSBIOSVersion)\n"
+            "Write-Output ('UUID:'         + $csp.UUID)\n"
+        )
         skip_vals = {"", "None", "N/A", "Not Available", "To Be Filled By O.E.M.",
                      "Default string", "System Product Name", "System Manufacturer",
                      "System Version", "INVALID", "00000000-0000-0000-0000-000000000000"}
+        mapping = {
+            "MANUFACTURER": "メーカー",
+            "MODEL":        "機種名",
+            "FAMILY":       "製品ファミリー",
+            "SERIAL":       "シリアルNo.",
+            "BIOSVER":      "BIOSバージョン",
+            "UUID":         "UUID",
+        }
+        tmp_path = None
+        try:
+            with _tf2.NamedTemporaryFile(mode='w', suffix='.ps1',
+                                         delete=False, encoding='utf-8') as tf:
+                tf.write(ps_script)
+                tmp_path = tf.name
+            for ps_exe in ["pwsh", "powershell"]:
+                try:
+                    r = subprocess.run(
+                        [ps_exe, "-NoProfile", "-NonInteractive",
+                         "-ExecutionPolicy", "Bypass", "-File", tmp_path],
+                        capture_output=True, text=True, timeout=20
+                    )
+                    if r.stdout.strip():
+                        for line in r.stdout.splitlines():
+                            line = line.strip()
+                            if ":" not in line:
+                                continue
+                            key, val = line.split(":", 1)
+                            val = val.strip()
+                            label = mapping.get(key.strip())
+                            if label and val and val not in skip_vals:
+                                info[label] = val
+                        break
+                except FileNotFoundError:
+                    continue
+                except subprocess.TimeoutExpired:
+                    break
+        except Exception:
+            pass
+        finally:
+            if tmp_path and _os2.path.exists(tmp_path):
+                try:
+                    _os2.remove(tmp_path)
+                except Exception:
+                    pass
 
-        def ps_get(script, label):
-            v = ps(script)
-            if v and v not in skip_vals:
-                info[label] = v
+        # フォールバック: winreg で直接読む（PowerShell不要・即時）
+        if "機種名" not in info or "シリアルNo." not in info:
+            try:
+                import winreg
+                reg_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                         r"HARDWARE\DESCRIPTION\System\BIOS")
+                reg_map = {
+                    "SystemManufacturer": "メーカー",
+                    "SystemProductName":  "機種名",
+                    "SystemVersion":      "製品バージョン",
+                    "BIOSVersion":        "BIOSバージョン",
+                }
+                for reg_name, label in reg_map.items():
+                    if label in info:
+                        continue
+                    try:
+                        val, _ = winreg.QueryValueEx(reg_key, reg_name)
+                        if val and val not in skip_vals:
+                            info[label] = val
+                    except Exception:
+                        pass
+                winreg.CloseKey(reg_key)
+            except Exception:
+                pass
 
-        # CIM (PowerShell 3+, Win8以降で確実に動作)
-        ps_get(
-            "(Get-CimInstance Win32_ComputerSystem).Manufacturer",
-            "メーカー")
-        ps_get(
-            "(Get-CimInstance Win32_ComputerSystem).Model",
-            "機種名")
-        ps_get(
-            "(Get-CimInstance Win32_ComputerSystem).SystemFamily",
-            "製品ファミリー")
-        ps_get(
-            "(Get-CimInstance Win32_BIOS).SerialNumber",
-            "シリアルNo.")
-        ps_get(
-            "(Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion",
-            "BIOSバージョン")
-        ps_get(
-            "(Get-CimInstance Win32_ComputerSystemProduct).UUID",
-            "UUID")
-
-        # フォールバック: WMI (古い PowerShell 向け)
         if not info:
-            ps_get(
-                "(Get-WmiObject Win32_ComputerSystem).Manufacturer",
-                "メーカー")
-            ps_get(
-                "(Get-WmiObject Win32_ComputerSystem).Model",
-                "機種名")
-            ps_get(
-                "(Get-WmiObject Win32_BIOS).SerialNumber",
-                "シリアルNo.")
-
-        # さらにフォールバック: レジストリ
-        if "機種名" not in info:
-            v = ps(r'(Get-ItemProperty "HKLM:\HARDWARE\DESCRIPTION\System\BIOS").SystemProductName')
-            if v and v not in skip_vals:
-                info["機種名"] = v
-        if "メーカー" not in info:
-            v = ps(r'(Get-ItemProperty "HKLM:\HARDWARE\DESCRIPTION\System\BIOS").SystemManufacturer')
-            if v and v not in skip_vals:
-                info["メーカー"] = v
-        if "シリアルNo." not in info:
-            v = ps(r'(Get-ItemProperty "HKLM:\HARDWARE\DESCRIPTION\System\BIOS").BIOSVendor')
-            if v and v not in skip_vals:
-                info["BIOSベンダー"] = v
-
-        if not info:
-            info["備考"] = "機種情報を取得できませんでした (管理者権限が必要な場合があります)"
-
+            info["備考"] = "機種情報を取得できませんでした"
     return info
 
 def get_os_info():
