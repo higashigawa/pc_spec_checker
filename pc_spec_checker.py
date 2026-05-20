@@ -21,6 +21,16 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+try:
+    import openpyxl  # noqa: F401
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+# PyInstallerでEXE化されているか判定
+import sys as _sys
+IS_FROZEN = getattr(_sys, "frozen", False)
+
 # ── カラーパレット ──────────────────────────────
 BG         = "#0d0f14"
 PANEL      = "#141820"
@@ -1735,16 +1745,27 @@ class PCSpecApp(tk.Tk):
         )
         self.scan_btn.pack(side="right", padx=(0, 4), pady=14)
 
+        # EXE化かつopenpyxl未同梱の場合のみグレーアウト
+        _xlsx_unavailable = IS_FROZEN and not HAS_OPENPYXL
+        xlsx_label = "📊 Excel出力" if not _xlsx_unavailable else "📊 Excel出力 (未対応)"
         self.xlsx_btn = tk.Button(
-            header, text="📊 Excel出力",
-            bg="#1d6f42", fg=TEXT_MAIN,
+            header, text=xlsx_label,
+            bg="#1d6f42" if not _xlsx_unavailable else "#2a2a2a",
+            fg=TEXT_MAIN if not _xlsx_unavailable else TEXT_SUB,
             font=self.font_small,
             relief="flat", padx=12, pady=4,
-            cursor="hand2",
+            cursor="hand2" if not _xlsx_unavailable else "arrow",
             command=self._export_xlsx,
             state="disabled"
         )
         self.xlsx_btn.pack(side="right", padx=(0, 4), pady=14)
+        if _xlsx_unavailable:
+            self.xlsx_btn.config(
+                command=lambda: messagebox.showinfo(
+                    "Excel出力非対応",
+                    "このEXEにはopenpyxlが同梱されていないため\nExcel出力はご利用いただけません。"
+                )
+            )
 
         self.csv_btn = tk.Button(
             header, text="📥 CSV出力",
@@ -1861,7 +1882,8 @@ class PCSpecApp(tk.Tk):
 
         self._update_status("完了")
         self.after(0, lambda: self.csv_btn.config(state="normal"))
-        self.after(0, lambda: self.xlsx_btn.config(state="normal"))
+        if not (IS_FROZEN and not HAS_OPENPYXL):
+            self.after(0, lambda: self.xlsx_btn.config(state="normal"))
 
     def _update_status(self, msg):
         self.after(0, lambda: self.status_lbl.config(text=msg))
@@ -2020,10 +2042,17 @@ class PCSpecApp(tk.Tk):
                              fg=TEXT_SUB, font=self.font_small)
         count_lbl.pack(side="left", padx=16)
 
-        export_xlsx_btn = tk.Button(footer, text="📊 Excel出力", bg="#1d6f42", fg=TEXT_MAIN,
-                                    font=self.font_small, relief="flat", padx=10, pady=3,
-                                    cursor="hand2", state="disabled",
-                                    command=lambda: self._export_scan_xlsx(tv, cols))
+        _scan_xlsx_unavailable = IS_FROZEN and not HAS_OPENPYXL
+        export_xlsx_btn = tk.Button(
+            footer,
+            text="📊 Excel出力" if not _scan_xlsx_unavailable else "📊 Excel出力 (未対応)",
+            bg="#1d6f42" if not _scan_xlsx_unavailable else "#2a2a2a",
+            fg=TEXT_MAIN if not _scan_xlsx_unavailable else TEXT_SUB,
+            font=self.font_small, relief="flat", padx=10, pady=3,
+            cursor="hand2" if not _scan_xlsx_unavailable else "arrow",
+            state="disabled",
+            command=lambda: self._export_scan_xlsx(tv, cols)
+        )
         export_xlsx_btn.pack(side="right", padx=4)
 
         export_btn = tk.Button(footer, text="📥 CSV出力", bg=ACCENT2, fg=TEXT_MAIN,
@@ -2179,7 +2208,8 @@ class PCSpecApp(tk.Tk):
                 progress_lbl.config(text="完了")
                 count_lbl.config(text=f"稼働中: {up} 台 / スキャン: {total} アドレス")
                 export_btn.config(state="normal")
-                export_xlsx_btn.config(state="normal")
+                if not _scan_xlsx_unavailable:
+                    export_xlsx_btn.config(state="normal")
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -2220,21 +2250,28 @@ class PCSpecApp(tk.Tk):
 
     def _export_scan_xlsx(self, tv, cols):
         """LANスキャン結果を書式付きExcelに出力"""
-        try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
-        except ImportError:
+        if not HAS_OPENPYXL:
+            if IS_FROZEN:
+                messagebox.showinfo("Excel出力非対応",
+                    "このEXEにはopenpyxlが同梱されていないため\nExcel出力はご利用いただけません。")
+                return
             if messagebox.askyesno(
                 "openpyxl が見つかりません",
                 "Excel出力には openpyxl が必要です。\n今すぐインストールしますか?\n\n  pip install openpyxl"
             ):
-                import subprocess as _sp, sys as _sys
+                import subprocess as _sp
                 try:
                     _sp.run([_sys.executable, "-m", "pip", "install", "openpyxl"], check=True)
                     messagebox.showinfo("完了", "インストール完了。もう一度押してください。")
                 except Exception as e:
                     messagebox.showerror("エラー", str(e))
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            messagebox.showerror("エラー", "openpyxl のインポートに失敗しました。")
             return
 
         default_name = f"lan_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -2387,21 +2424,30 @@ class PCSpecApp(tk.Tk):
 
     def _export_xlsx(self):
         """全スペック情報を見やすい書式付き Excel ファイルに出力する"""
-        try:
-            import openpyxl
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
-        except ImportError:
+        if not HAS_OPENPYXL:
+            if IS_FROZEN:
+                messagebox.showinfo("Excel出力非対応",
+                    "このEXEにはopenpyxlが同梱されていないため\nExcel出力はご利用いただけません。")
+                return
+            # Python直実行: インストールを促す
             if messagebox.askyesno(
                 "openpyxl が見つかりません",
                 "Excel出力には openpyxl が必要です。\n今すぐインストールしますか?\n\n  pip install openpyxl"
             ):
-                import subprocess as _sp, sys as _sys
+                import subprocess as _sp
                 try:
                     _sp.run([_sys.executable, "-m", "pip", "install", "openpyxl"], check=True)
                     messagebox.showinfo("完了", "インストール完了。もう一度「Excel出力」を押してください。")
                 except Exception as e:
                     messagebox.showerror("エラー", "インストール失敗:\n" + str(e))
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            messagebox.showerror("エラー", "openpyxl のインポートに失敗しました。")
             return
 
         stem = self._get_default_stem()
