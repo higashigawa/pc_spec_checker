@@ -656,33 +656,132 @@ def get_printer_info():
                 p["オプション数"] = f"{len(detail_out.splitlines())} 項目"
 
     elif sys_name == "Linux":
-        lp_out = run_command(["lpstat", "-p", "-d"])
-        for line in lp_out.splitlines():
-            line = line.strip()
-            if line.startswith("printer "):
-                parts = line.split()
-                name = parts[1] if len(parts) > 1 else ""
-                status = "待機中"
-                if "is idle" in line:
-                    status = "待機中"
-                elif "printing" in line:
-                    status = "印刷中"
-                elif "disabled" in line or "stopped" in line:
-                    status = "停止"
-                printers.append({"プリンター名": name, "状態": status})
-            elif line.startswith("system default destination:"):
-                default_name = line.split(":", 1)[1].strip()
-                for p in printers:
-                    if p["プリンター名"] == default_name:
-                        p["既定"] = "はい"
+        # ── 方法1: python3-cups (pycups) ─────────────────────
+        try:
+            import cups
+            conn = cups.Connection()
+            dests = conn.getDests()
+            default_name = ""
+            # デフォルトプリンター名を取得
+            try:
+                default_name = conn.getDefault() or ""
+            except Exception:
+                pass
+            # プリンター詳細を取得
+            printers_detail = {}
+            try:
+                printers_detail = conn.getPrinters()
+            except Exception:
+                pass
+            for (name, inst), dest in dests.items():
+                if not name:
+                    continue
+                info = printers_detail.get(name, {})
+                state_code = info.get("printer-state", 0)
+                state_map = {3: "待機中", 4: "印刷中", 5: "停止"}
+                status = state_map.get(state_code, "不明")
+                p = {
+                    "プリンター名": name,
+                    "状態": status,
+                }
+                if name == default_name:
+                    p["既定"] = "はい"
+                uri = info.get("device-uri", "")
+                if uri:
+                    p["URI"] = uri
+                location = info.get("printer-location", "")
+                if location:
+                    p["場所"] = location
+                driver = info.get("printer-make-and-model", "")
+                if driver:
+                    p["ドライバー"] = driver
+                printers.append(p)
+        except ImportError:
+            pass
+        except Exception:
+            pass
 
-        # CUPS URI も取得
-        for p in printers:
-            uri_out = run_command(["lpstat", "-v", p["プリンター名"]])
-            if uri_out and ":" in uri_out:
-                parts = uri_out.split(":", 2)
-                if len(parts) >= 3:
-                    p["URI"] = parts[2].strip()
+        # ── 方法2: lpstat コマンド ───────────────────────────
+        if not printers:
+            lp_out = run_command(["lpstat", "-p", "-d"])
+            if not lp_out:
+                # CUPS サービスが停止している場合は起動を試みる（権限があれば）
+                run_command(["sh", "-c", "systemctl start cups 2>/dev/null || true"])
+                lp_out = run_command(["lpstat", "-p", "-d"])
+            for line in lp_out.splitlines():
+                line_stripped = line.strip()
+                if line_stripped.startswith("printer "):
+                    parts = line_stripped.split()
+                    name = parts[1] if len(parts) > 1 else ""
+                    if not name:
+                        continue
+                    status = "待機中"
+                    if "is idle" in line_stripped:
+                        status = "待機中"
+                    elif "printing" in line_stripped or "is busy" in line_stripped:
+                        status = "印刷中"
+                    elif "disabled" in line_stripped or "stopped" in line_stripped:
+                        status = "停止"
+                    printers.append({"プリンター名": name, "状態": status})
+                elif line_stripped.startswith("system default destination:"):
+                    default_name = line_stripped.split(":", 1)[1].strip()
+                    for p in printers:
+                        if p["プリンター名"] == default_name:
+                            p["既定"] = "はい"
+
+            # CUPS URI を取得 ("device for <name>: <uri>" 形式に対応)
+            if printers:
+                uri_all = run_command(["lpstat", "-v"])
+                uri_map = {}
+                for line in uri_all.splitlines():
+                    # "device for PrinterName: uri://..."
+                    m = re.match(r"device for ([^:]+):\s*(.+)", line.strip())
+                    if m:
+                        uri_map[m.group(1).strip()] = m.group(2).strip()
+                for p in printers:
+                    uri = uri_map.get(p["プリンター名"], "")
+                    if uri:
+                        p["URI"] = uri
+
+            # ドライバー情報を lpinfo で補完
+            for p in printers:
+                detail_out = run_command(
+                    ["lpoptions", "-p", p["プリンター名"], "-l"]
+                )
+                if detail_out:
+                    p["オプション数"] = f"{len(detail_out.splitlines())} 項目"
+
+        # ── 方法3: /etc/cups/printers.conf を直接読む ─────────
+        if not printers:
+            conf_path = "/etc/cups/printers.conf"
+            try:
+                with open(conf_path, "r", encoding="utf-8", errors="replace") as f:
+                    conf_text = f.read()
+                cur = {}
+                for line in conf_text.splitlines():
+                    line = line.strip()
+                    if line.startswith("<Printer "):
+                        cur = {"プリンター名": line[9:].rstrip(">")}
+                    elif line == "</Printer>" and cur.get("プリンター名"):
+                        printers.append(cur)
+                        cur = {}
+                    elif line.startswith("DeviceURI "):
+                        cur["URI"] = line[10:].strip()
+                    elif line.startswith("Info "):
+                        cur["情報"] = line[5:].strip()
+                    elif line.startswith("MakeModel "):
+                        cur["ドライバー"] = line[10:].strip()
+                    elif line.startswith("State "):
+                        state = line[6:].strip()
+                        cur["状態"] = {"Idle": "待機中", "Processing": "印刷中",
+                                       "Stopped": "停止"}.get(state, state)
+                    elif line == "DefaultPrinter" or line.startswith("DefaultPrinter "):
+                        if cur.get("プリンター名"):
+                            cur["既定"] = "はい"
+            except PermissionError:
+                printers.append({"備考": "/etc/cups/printers.conf の読み取り権限がありません (sudo が必要)"})
+            except FileNotFoundError:
+                pass
 
     if not printers:
         printers.append({"備考": "プリンターが見つかりませんでした"})
