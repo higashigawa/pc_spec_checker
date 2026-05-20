@@ -1715,6 +1715,16 @@ class PCSpecApp(tk.Tk):
             font=self.font_title
         ).pack(side="left", padx=24, pady=14)
 
+        self.wifi_btn = tk.Button(
+            header, text="📡 Wi-Fi アナライザー",
+            bg=ACCENT2, fg=TEXT_MAIN,
+            font=self.font_small,
+            relief="flat", padx=12, pady=4,
+            cursor="hand2",
+            command=self._open_wifi_analyzer,
+        )
+        self.wifi_btn.pack(side="right", padx=(0, 4), pady=14)
+
         self.scan_btn = tk.Button(
             header, text="🔍 LAN スキャン",
             bg="#7B3F00", fg=TEXT_MAIN,
@@ -1890,16 +1900,59 @@ class PCSpecApp(tk.Tk):
         try:
             if HAS_PSUTIL:
                 import psutil as _ps
+                stats = _ps.net_if_stats()
+                candidates = []  # (優先度, cidr文字列)
                 for iface, addrs in _ps.net_if_addrs().items():
+                    st = stats.get(iface)
+                    # リンクダウンのインターフェースは除外
+                    if st and not st.isup:
+                        continue
+                    iface_l = iface.lower()
                     for a in addrs:
-                        if a.family.name == "AF_INET" and not a.address.startswith("127."):
-                            ip = ipaddress.IPv4Address(a.address)
-                            mask = a.netmask or "255.255.255.0"
-                            net = ipaddress.IPv4Network(f"{a.address}/{mask}", strict=False)
-                            default_cidr = str(net)
-                            raise StopIteration
-        except StopIteration:
-            pass
+                        if a.family.name != "AF_INET":
+                            continue
+                        if a.address.startswith("127."):
+                            continue
+                        ip = ipaddress.IPv4Address(a.address)
+                        # APIPA (169.254.x.x) は最低優先度
+                        if str(ip).startswith("169.254."):
+                            priority = 99
+                        # 仮想アダプター系は低優先度
+                        elif any(k in iface_l for k in (
+                                "hyper-v", "virtual", "vmware", "vbox",
+                                "loopback", "bluetooth", "テザリング")):
+                            priority = 50
+                        # 通常のプライベートアドレス
+                        elif (str(ip).startswith("192.168.") or
+                              str(ip).startswith("10.") or
+                              str(ip).startswith("172.")):
+                            priority = 1
+                        else:
+                            priority = 10
+                        mask = a.netmask or "255.255.255.0"
+                        net = ipaddress.IPv4Network(f"{a.address}/{mask}", strict=False)
+                        candidates.append((priority, str(net)))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    default_cidr = candidates[0][1]
+            else:
+                # psutil なし: ipconfig から取得
+                import subprocess as _sp
+                out = _sp.run("ipconfig", capture_output=True, shell=True,
+                              timeout=5).stdout
+                for enc in ("cp932", "utf-8", "latin-1"):
+                    try:
+                        text = out.decode(enc); break
+                    except Exception:
+                        pass
+                import re as _re
+                for line in text.splitlines():
+                    m = _re.search(r"IPv4.*?:\s+(\d+\.\d+\.\d+\.\d+)", line)
+                    if m:
+                        ip_str = m.group(1)
+                        if not ip_str.startswith(("127.", "169.254.")):
+                            default_cidr = ip_str.rsplit(".", 1)[0] + ".0/24"
+                            break
         except Exception:
             pass
 
@@ -2076,6 +2129,11 @@ class PCSpecApp(tk.Tk):
             def update_ui(result):
                 if result is None:
                     return
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
                 ip, hostname_r, mac, vendor, status, is_self = result
                 found[0] += 1
                 tag = "self_pc" if is_self else "up"
@@ -2088,6 +2146,14 @@ class PCSpecApp(tk.Tk):
                 for i, (_, k) in enumerate(items):
                     tv.move(k, "", i)
 
+            def _safe_after(func):
+                """ウィンドウが存在するときだけ func を実行するラッパー"""
+                try:
+                    if win.winfo_exists():
+                        func()
+                except Exception:
+                    pass
+
             def worker():
                 max_workers = min(128, total)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -2098,13 +2164,13 @@ class PCSpecApp(tk.Tk):
                         done[0] += 1
                         result = fut.result()
                         if result:
-                            win.after(0, lambda r=result: update_ui(r))
+                            win.after(0, lambda r=result: _safe_after(lambda: update_ui(r)))
                         pct = int(done[0] / total * 100)
                         win.after(0, lambda p=pct, d=done[0], t=total:
-                                  progress_lbl.config(
-                                      text=f"{d}/{t} ({p}%)"))
+                                  _safe_after(lambda: progress_lbl.config(
+                                      text=f"{d}/{t} ({p}%)")))
 
-                win.after(0, scan_finished)
+                win.after(0, lambda: _safe_after(scan_finished))
 
             def scan_finished():
                 scan_btn_inner.config(text="▶ スキャン開始", command=do_scan,
@@ -2119,6 +2185,11 @@ class PCSpecApp(tk.Tk):
 
         def do_stop():
             stop_flag["stop"] = True
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
             scan_btn_inner.config(text="▶ スキャン開始", command=do_scan,
                                   bg=ACCENT, fg="#000000")
             progress_lbl.config(text="停止しました")
@@ -2934,6 +3005,7 @@ class PCSpecApp(tk.Tk):
 
     def _render_network(self, tab, interfaces: list):
         frame = self._scrollable(tab)
+
         if not interfaces:
             self._section_label(frame, "ネットワーク")
             tk.Label(frame, text="情報を取得できませんでした",
@@ -2960,6 +3032,579 @@ class PCSpecApp(tk.Tk):
                 else:
                     self._kv_row(frame, k, v, alt=(i % 2 == 1))
 
+
+    def _open_wifi_analyzer(self):
+        """Wi-Fi アナライザーを独立ウィンドウで開く"""
+        import math
+
+        win = tk.Toplevel(self)
+        win.title("📡 Wi-Fi アナライザー")
+        win.geometry("1000x700")
+        win.configure(bg=BG)
+        win.resizable(True, True)
+
+        COLORS = [
+            "#00d4ff", "#00e87a", "#ffd166", "#ff4d6d", "#7b4fff",
+            "#ff8c42", "#c0ff72", "#ff72d4", "#72d4ff", "#ffbe72",
+            "#72ffbe", "#be72ff", "#ff7272", "#72ff72", "#7272ff",
+        ]
+
+        networks = []
+
+        # ── レイアウト: pack で確実にサイズを確定させる ──────────
+        # ツールバー
+        toolbar = tk.Frame(win, bg=PANEL, height=50)
+        toolbar.pack(fill="x", side="top")
+        toolbar.pack_propagate(False)
+
+        tk.Label(toolbar, text="📡  Wi-Fi アナライザー",
+                 bg=PANEL, fg=ACCENT,
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=16, pady=12)
+
+        status_lbl = tk.Label(toolbar, text="スキャン中...",
+                              bg=PANEL, fg=YELLOW, font=("Segoe UI", 9))
+        status_lbl.pack(side="left", padx=8)
+
+        band_var = tk.StringVar(value="両方")
+        for btext in ("両方", "2.4 GHz", "5 GHz"):
+            tk.Radiobutton(
+                toolbar, text=btext, variable=band_var, value=btext,
+                bg=PANEL, fg=TEXT_MAIN, selectcolor=BG,
+                activebackground=PANEL, font=("Segoe UI", 9),
+                command=lambda: _redraw()
+            ).pack(side="left", padx=4)
+
+        rescan_btn = tk.Button(
+            toolbar, text="🔄 再スキャン",
+            bg=ACCENT2, fg=TEXT_MAIN, relief="flat",
+            font=("Segoe UI", 9, "bold"), padx=12,
+            cursor="hand2"
+        )
+        rescan_btn.pack(side="right", padx=12, pady=10)
+
+        # グラフCanvas（pack で幅は自動、高さは固定）
+        canvas = tk.Canvas(win, bg="#0a0c10", height=300, highlightthickness=0)
+        canvas.pack(fill="x", side="top")
+
+        # リストエリア（残りの高さをすべて使う）
+        list_outer = tk.Frame(win, bg=BG)
+        list_outer.pack(fill="both", expand=True)
+
+        list_canvas = tk.Canvas(list_outer, bg=BG, highlightthickness=0)
+        list_sb = ttk.Scrollbar(list_outer, orient="vertical",
+                                command=list_canvas.yview)
+        list_frame = tk.Frame(list_canvas, bg=BG)
+        list_frame.bind("<Configure>",
+                        lambda e: list_canvas.configure(
+                            scrollregion=list_canvas.bbox("all")))
+        list_win_id = list_canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        list_canvas.configure(yscrollcommand=list_sb.set)
+        list_canvas.bind("<Configure>",
+                         lambda e: list_canvas.itemconfig(list_win_id, width=e.width))
+        list_sb.pack(side="right", fill="y")
+        list_canvas.pack(side="left", fill="both", expand=True)
+        win.bind("<MouseWheel>",
+                 lambda e: list_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        # ── 描画関数 ─────────────────────────────────────────
+        def _draw_graph(nets):
+            canvas.delete("all")
+            w = canvas.winfo_width()
+            h = canvas.winfo_height()
+            if w <= 1 or h <= 1:
+                return
+
+            PAD_L, PAD_R, PAD_T, PAD_B = 56, 24, 18, 36
+            graph_w = w - PAD_L - PAD_R
+            graph_h = h - PAD_T - PAD_B
+
+            band = band_var.get()
+            if band == "2.4 GHz":
+                ch_min, ch_max = 1, 14
+            elif band == "5 GHz":
+                chs = [n["channel"] for n in nets if n.get("band") == "5GHz" and n.get("channel")]
+                ch_min = max(1, min(chs) - 4) if chs else 36
+                ch_max = (max(chs) + 4) if chs else 165
+            else:
+                chs = [n["channel"] for n in nets if n.get("channel")]
+                if not chs:
+                    ch_min, ch_max = 1, 14
+                elif max(chs) <= 14:
+                    ch_min, ch_max = 1, 14
+                elif min(chs) > 14:
+                    ch_min = max(1, min(chs) - 4)
+                    ch_max = max(chs) + 4
+                else:
+                    ch_min, ch_max = 1, max(chs) + 4
+
+            ch_span = max(ch_max - ch_min, 1)
+
+            def ch_to_x(ch):
+                return PAD_L + (ch - ch_min) / ch_span * graph_w
+
+            def dbm_to_y(dbm):
+                ratio = (dbm + 100) / 80
+                return PAD_T + graph_h * (1 - ratio)
+
+            y_base = PAD_T + graph_h
+
+            # グリッド
+            for dbm in (-90, -80, -70, -60, -50, -40, -30):
+                y = dbm_to_y(dbm)
+                canvas.create_line(PAD_L, y, w - PAD_R, y, fill="#1e2433", dash=(4, 4))
+                canvas.create_text(PAD_L - 4, y, text=str(dbm),
+                                   fill=TEXT_SUB, font=("Segoe UI", 7), anchor="e")
+
+            canvas.create_text(12, PAD_T + graph_h // 2, text="dBm",
+                               fill=TEXT_SUB, font=("Segoe UI", 7), angle=90, anchor="center")
+
+            if band == "2.4 GHz":
+                tick_chs = list(range(1, 15))
+            elif band == "5 GHz":
+                tick_chs = [c for c in [36,40,44,48,52,56,60,64,100,104,108,112,116,120,
+                                        124,128,132,136,140,149,153,157,161,165]
+                            if ch_min <= c <= ch_max]
+            else:
+                tick_chs = [c for c in range(ch_min, ch_max + 1) if c <= 14 or c in _CH_FREQ]
+
+            for ch in tick_chs:
+                x = ch_to_x(ch)
+                canvas.create_line(x, PAD_T, x, y_base, fill="#1a1e2a", dash=(2, 4))
+                canvas.create_text(x, h - PAD_B + 6, text=str(ch),
+                                   fill=TEXT_SUB, font=("Segoe UI", 7), anchor="n")
+
+            canvas.create_text(w // 2, h - 6, text="Wi-Fi チャネル",
+                               fill=TEXT_SUB, font=("Segoe UI", 8), anchor="s")
+            canvas.create_line(PAD_L, y_base, w - PAD_R, y_base, fill=BORDER)
+
+            for idx, net in enumerate(nets):
+                ch  = net.get("channel", 0)
+                dbm = net.get("signal_dbm", -80)
+                wid = net.get("width_mhz", 20)
+                col = COLORS[idx % len(COLORS)]
+                if not ch:
+                    continue
+                half_ch = (wid / 2) / 5
+                cx = ch_to_x(ch)
+                peak_y = dbm_to_y(dbm)
+                pts = []
+                for i in range(61):
+                    t = -1 + 2 * i / 60
+                    x = cx + t * half_ch * (graph_w / ch_span)
+                    y = peak_y + (y_base - peak_y) * (1 - math.exp(-3 * t * t))
+                    pts += [x, y]
+                fill_pts = [pts[0], y_base] + pts + [pts[-2], y_base]
+                canvas.create_polygon(fill_pts, fill=col, outline="", stipple="gray25")
+                canvas.create_line(*pts, fill=col, width=2, smooth=True)
+                ssid = net.get("ssid", "")
+                if ssid:
+                    canvas.create_text(cx, peak_y - 6, text=ssid,
+                                       fill=col, font=("Segoe UI", 8, "bold"), anchor="s")
+
+        def _draw_list(nets):
+            for w in list_frame.winfo_children():
+                w.destroy()
+
+            # エラー情報が含まれる場合は詳細を表示
+            if nets and "_error" in nets[0]:
+                tk.Label(list_frame,
+                         text="⚠️  Wi-Fi スキャンに失敗しました",
+                         bg=BG, fg=YELLOW,
+                         font=("Segoe UI", 11, "bold")).pack(pady=(30, 8))
+                tk.Label(list_frame,
+                         text=nets[0]["_error"],
+                         bg=BG, fg=TEXT_SUB, font=("Segoe UI", 9),
+                         justify="left", wraplength=700).pack(padx=40, pady=4)
+                return
+
+            if not nets:
+                tk.Label(list_frame,
+                         text="Wi-Fi ネットワークが見つかりませんでした",
+                         bg=BG, fg=TEXT_SUB, font=("Segoe UI", 10),
+                         justify="center").pack(pady=40)
+                return
+
+            hdr = tk.Frame(list_frame, bg=PANEL)
+            hdr.pack(fill="x")
+            for i, (txt, w_) in enumerate([
+                ("", 3), ("SSID", 24), ("CH", 6), ("帯域", 8),
+                ("幅", 7), ("信号強度", 18), ("認証", 14)
+            ]):
+                tk.Label(hdr, text=txt, bg=PANEL, fg=TEXT_SUB,
+                         font=("Segoe UI", 8, "bold"),
+                         width=w_, anchor="w").grid(row=0, column=i, padx=4, pady=4, sticky="w")
+
+            for idx, net in enumerate(nets):
+                col = COLORS[idx % len(COLORS)]
+                bg  = "#111520" if idx % 2 else BG
+                row = tk.Frame(list_frame, bg=bg)
+                row.pack(fill="x")
+                dbm = net.get("signal_dbm", -80)
+                bars = max(0, min(5, int((dbm + 100) / 16)))
+                bar_str = "▂▄▆▇█"[:bars].ljust(5, "░")
+                pct = max(0, min(100, int((dbm + 100) * 2)))
+                sig_col = GREEN if dbm >= -60 else YELLOW if dbm >= -75 else RED
+                for ci, (txt, fg, w_) in enumerate([
+                    ("●",  col,     3),
+                    (net.get("ssid", "—"),               TEXT_MAIN, 24),
+                    (str(net.get("channel", "—")),        TEXT_VAL,  6),
+                    (net.get("band", "—"),                TEXT_VAL,  8),
+                    (f'{net.get("width_mhz","—")} MHz',  TEXT_VAL,  7),
+                    (f"{bar_str} {dbm}dBm ({pct}%)",     sig_col,   18),
+                    (net.get("auth", "—"),                TEXT_SUB,  14),
+                ]):
+                    tk.Label(row, text=txt, bg=bg, fg=fg,
+                             font=("Segoe UI", 9), width=w_, anchor="w").grid(
+                        row=0, column=ci, padx=4, pady=3, sticky="w")
+
+        def _redraw():
+            band = band_var.get()
+            # エラーデータはそのまま渡す
+            if networks and "_error" in networks[0]:
+                visible = networks
+            elif band == "2.4 GHz":
+                visible = [n for n in networks if n.get("band") == "2.4GHz"]
+            elif band == "5 GHz":
+                visible = [n for n in networks if n.get("band") == "5GHz"]
+            else:
+                visible = list(networks)
+            _draw_graph(visible)
+            _draw_list(visible)
+
+        def _do_scan():
+            nonlocal networks
+            rescan_btn.config(state="disabled", text="スキャン中...")
+            status_lbl.config(text="スキャン中...")
+
+            def _worker():
+                nonlocal networks
+                data = get_wifi_networks()
+                networks = data
+                win.after(0, _scan_done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _scan_done():
+            count = len(networks)
+            status_lbl.config(
+                text=f"{count} 件検出" if count else "見つかりませんでした",
+                fg=GREEN if count else YELLOW
+            )
+            rescan_btn.config(state="normal", text="🔄 再スキャン")
+            _redraw()
+
+        rescan_btn.config(command=_do_scan)
+
+        # Canvas リサイズ時に再描画（pack なので必ず発火する）
+        canvas.bind("<Configure>", lambda e: _redraw())
+
+        # ウィンドウを開いたら即スキャン開始
+        win.after(100, _do_scan)
+
+    def _render_wifi_analyzer(self, tab, networks: list):
+        """(旧タブ方式・未使用) 互換のため残す"""
+        pass
+        """Wi-Fi アナライザー: チャネルグラフ + ネットワーク一覧"""
+        import math
+
+        # ── 既存ウィジェットをクリア ───────────────────────────
+        for w in tab.winfo_children():
+            w.destroy()
+
+        # ── 色パレット ────────────────────────────────────────
+        COLORS = [
+            "#00d4ff", "#00e87a", "#ffd166", "#ff4d6d", "#7b4fff",
+            "#ff8c42", "#c0ff72", "#ff72d4", "#72d4ff", "#ffbe72",
+            "#72ffbe", "#be72ff", "#ff7272", "#72ff72", "#7272ff",
+        ]
+
+        # ── grid レイアウト ───────────────────────────────────
+        tab.rowconfigure(0, weight=0)
+        tab.rowconfigure(1, weight=3)
+        tab.rowconfigure(2, weight=2)
+        tab.columnconfigure(0, weight=1)
+
+        # ── ツールバー ────────────────────────────────────────
+        toolbar = tk.Frame(tab, bg=PANEL, height=44)
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.pack_propagate(False)
+
+        tk.Label(toolbar, text="📡  Wi-Fi アナライザー",
+                 bg=PANEL, fg=ACCENT, font=("Segoe UI", 11, "bold")).pack(
+            side="left", padx=16, pady=10)
+
+        band_var = tk.StringVar(value="両方")
+        for btext in ("両方", "2.4 GHz", "5 GHz"):
+            tk.Radiobutton(
+                toolbar, text=btext, variable=band_var, value=btext,
+                bg=PANEL, fg=TEXT_MAIN, selectcolor=BG,
+                activebackground=PANEL, font=("Segoe UI", 9),
+                command=lambda: _redraw()
+            ).pack(side="left", padx=6)
+
+        def _rescan():
+            rescan_btn.config(state="disabled", text="スキャン中...")
+            def _do():
+                new_data = get_wifi_networks()
+                self.after(0, lambda: _update(new_data))
+            threading.Thread(target=_do, daemon=True).start()
+
+        def _update(new_data):
+            nonlocal networks
+            networks = new_data
+            rescan_btn.config(state="normal", text="🔄 再スキャン")
+            _redraw()
+
+        rescan_btn = tk.Button(
+            toolbar, text="🔄 再スキャン",
+            bg=ACCENT2, fg=TEXT_MAIN, relief="flat",
+            font=("Segoe UI", 9, "bold"), padx=12,
+            cursor="hand2", command=_rescan
+        )
+        rescan_btn.pack(side="right", padx=12, pady=8)
+
+        # ── グラフ Canvas ─────────────────────────────────────
+        canvas = tk.Canvas(tab, bg="#0a0c10", height=260, highlightthickness=0)
+        canvas.grid(row=1, column=0, sticky="nsew")
+
+        # ── リスト ────────────────────────────────────────────
+        list_outer = tk.Frame(tab, bg=BG)
+        list_outer.grid(row=2, column=0, sticky="nsew")
+        list_outer.rowconfigure(0, weight=1)
+        list_outer.columnconfigure(0, weight=1)
+
+        list_canvas = tk.Canvas(list_outer, bg=BG, highlightthickness=0)
+        list_sb = ttk.Scrollbar(list_outer, orient="vertical",
+                                command=list_canvas.yview)
+        list_frame = tk.Frame(list_canvas, bg=BG)
+        list_frame.bind("<Configure>",
+                        lambda e: list_canvas.configure(
+                            scrollregion=list_canvas.bbox("all")))
+        list_win = list_canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        list_canvas.configure(yscrollcommand=list_sb.set)
+        list_canvas.bind("<Configure>",
+                         lambda e: list_canvas.itemconfig(list_win, width=e.width))
+        list_canvas.grid(row=0, column=0, sticky="nsew")
+        list_sb.grid(row=0, column=1, sticky="ns")
+        list_canvas.bind_all("<MouseWheel>",
+                             lambda e: list_canvas.yview_scroll(
+                                 -1 * (e.delta // 120), "units"))
+
+        # ── 描画関数 ────────────────────────────────────────
+        def _draw_graph(nets):
+            canvas.delete("all")
+            w = canvas.winfo_width() or 900
+            h = canvas.winfo_height() or 280
+
+            PAD_L, PAD_R, PAD_T, PAD_B = 56, 24, 18, 36
+
+            graph_w = w - PAD_L - PAD_R
+            graph_h = h - PAD_T - PAD_B
+
+            # バンドに応じてチャネル範囲を決定
+            band = band_var.get()
+            if band == "2.4 GHz":
+                ch_min, ch_max = 1, 14
+            elif band == "5 GHz":
+                chs = [n["channel"] for n in nets if n.get("band") == "5GHz" and n.get("channel")]
+                if chs:
+                    ch_min = max(1, min(chs) - 4)
+                    ch_max = max(chs) + 4
+                else:
+                    ch_min, ch_max = 36, 165
+            else:  # 両方
+                chs = [n["channel"] for n in nets if n.get("channel")]
+                if not chs:
+                    ch_min, ch_max = 1, 14
+                elif max(chs) <= 14:
+                    ch_min, ch_max = 1, 14
+                elif min(chs) > 14:
+                    ch_min = max(1, min(chs) - 4)
+                    ch_max = max(chs) + 4
+                else:
+                    ch_min, ch_max = 1, max(chs) + 4
+
+            ch_span = max(ch_max - ch_min, 1)
+
+            def ch_to_x(ch):
+                return PAD_L + (ch - ch_min) / ch_span * graph_w
+
+            def dbm_to_y(dbm):
+                # -100 dBm → 下端, -20 dBm → 上端
+                ratio = (dbm - (-100)) / ((-20) - (-100))
+                return PAD_T + graph_h * (1 - ratio)
+
+            # グリッド描画
+            for dbm in (-90, -80, -70, -60, -50, -40, -30):
+                y = dbm_to_y(dbm)
+                canvas.create_line(PAD_L, y, w - PAD_R, y,
+                                   fill="#1e2433", dash=(4, 4))
+                canvas.create_text(PAD_L - 4, y, text=str(dbm),
+                                   fill=TEXT_SUB, font=("Segoe UI", 7),
+                                   anchor="e")
+            canvas.create_text(PAD_L - 10, PAD_T + graph_h // 2,
+                               text="dBm", fill=TEXT_SUB, font=("Segoe UI", 7),
+                               angle=90, anchor="center")
+
+            # チャネルグリッド
+            if band == "2.4 GHz":
+                tick_chs = list(range(1, 15))
+            elif band == "5 GHz":
+                tick_chs = [c for c in [36,40,44,48,52,56,60,64,
+                                        100,104,108,112,116,120,124,128,
+                                        132,136,140,149,153,157,161,165]
+                            if ch_min <= c <= ch_max]
+            else:
+                tick_chs = [c for c in range(ch_min, ch_max + 1)
+                            if c <= 14 or c in _CH_FREQ]
+
+            for ch in tick_chs:
+                x = ch_to_x(ch)
+                canvas.create_line(x, PAD_T, x, PAD_T + graph_h,
+                                   fill="#1a1e2a", dash=(2, 4))
+                canvas.create_text(x, h - PAD_B + 6, text=str(ch),
+                                   fill=TEXT_SUB, font=("Segoe UI", 7),
+                                   anchor="n")
+
+            canvas.create_text(w // 2, h - 6, text="Wi-Fi チャネル",
+                               fill=TEXT_SUB, font=("Segoe UI", 8), anchor="s")
+
+            # 下端ライン
+            canvas.create_line(PAD_L, PAD_T + graph_h,
+                               w - PAD_R, PAD_T + graph_h, fill=BORDER)
+
+            # ── ネットワークごとにベル曲線を描画 ────────────────
+            y_base = dbm_to_y(-100)
+
+            for idx, net in enumerate(nets):
+                ch    = net.get("channel", 0)
+                dbm   = net.get("signal_dbm", -80)
+                width = net.get("width_mhz", 20)
+                color = COLORS[idx % len(COLORS)]
+
+                if not ch:
+                    continue
+
+                # チャネル幅をチャネル数に換算 (5 MHz/ch)
+                half_span_ch = (width / 2) / 5
+
+                cx = ch_to_x(ch)
+                peak_y = dbm_to_y(dbm)
+
+                # ベル曲線 (半径 = half_span_ch チャネル分)
+                pts = []
+                steps = 60
+                for i in range(steps + 1):
+                    t = -1 + 2 * i / steps   # -1 〜 +1
+                    x = cx + t * half_span_ch * (graph_w / ch_span)
+                    # ガウシアン形状
+                    y = peak_y + (y_base - peak_y) * (1 - math.exp(-3 * t * t))
+                    pts.extend([x, y])
+
+                # 閉じた多角形（塗りつぶし）
+                fill_pts = [pts[0], y_base] + pts + [pts[-2], y_base]
+                canvas.create_polygon(fill_pts,
+                                      fill=color, outline="", stipple="gray25")
+                canvas.create_line(*pts, fill=color, width=2, smooth=True)
+
+                # SSID ラベル（ピーク付近）
+                ssid = net.get("ssid", "")
+                if ssid:
+                    canvas.create_text(cx, peak_y - 6, text=ssid,
+                                       fill=color, font=("Segoe UI", 8, "bold"),
+                                       anchor="s")
+
+        def _draw_list(nets):
+            for w in list_frame.winfo_children():
+                w.destroy()
+
+            if not nets:
+                tk.Label(list_frame,
+                         text="Wi-Fiネットワークが見つかりませんでした\n（管理者権限が必要な場合があります）",
+                         bg=BG, fg=TEXT_SUB, font=("Segoe UI", 10),
+                         justify="center").pack(pady=40)
+                return
+
+            # ヘッダー
+            hdr = tk.Frame(list_frame, bg=PANEL)
+            hdr.pack(fill="x", padx=0, pady=0)
+            cols = [
+                ("", 18), ("SSID", 22), ("チャネル", 9), ("帯域", 8),
+                ("幅", 7), ("信号強度", 12), ("認証", 10),
+            ]
+            for i, (txt, w_pct) in enumerate(cols):
+                tk.Label(hdr, text=txt, bg=PANEL, fg=TEXT_SUB,
+                         font=("Segoe UI", 8, "bold"),
+                         width=w_pct, anchor="w").grid(
+                    row=0, column=i, padx=4, pady=4, sticky="w")
+
+            for idx, net in enumerate(nets):
+                color = COLORS[idx % len(COLORS)]
+                bg = "#111520" if idx % 2 == 1 else BG
+                row = tk.Frame(list_frame, bg=bg)
+                row.pack(fill="x")
+
+                dbm   = net.get("signal_dbm", -80)
+                # 信号強度バー (0〜5本)
+                bars = max(0, min(5, int((dbm + 100) / 16)))
+                bar_str = "▂▄▆▇█"[:bars].ljust(5, "░")
+
+                # dBm → % 変換（表示用）
+                pct = max(0, min(100, int((dbm + 100) * 2)))
+
+                vals = [
+                    ("●", color),
+                    (net.get("ssid", "—"), TEXT_MAIN),
+                    (str(net.get("channel", "—")), TEXT_VAL),
+                    (net.get("band", "—"), TEXT_VAL),
+                    (f'{net.get("width_mhz","—")} MHz', TEXT_VAL),
+                    (f"{bar_str}  {dbm} dBm ({pct}%)",
+                     GREEN if dbm >= -60 else YELLOW if dbm >= -75 else RED),
+                    (net.get("auth", "—"), TEXT_SUB),
+                ]
+                col_widths = [c[1] for c in cols]
+                for ci, ((txt, fg), cw) in enumerate(zip(vals, col_widths)):
+                    tk.Label(row, text=txt, bg=bg, fg=fg,
+                             font=("Segoe UI", 9),
+                             width=cw, anchor="w").grid(
+                        row=0, column=ci, padx=4, pady=3, sticky="w")
+
+        def _redraw(*_):
+            band = band_var.get()
+            if band == "2.4 GHz":
+                visible = [n for n in networks if n.get("band") == "2.4GHz"]
+            elif band == "5 GHz":
+                visible = [n for n in networks if n.get("band") == "5GHz"]
+            else:
+                visible = networks
+            _draw_graph(visible)
+            _draw_list(visible)
+
+        # ── 描画トリガー ─────────────────────────────────────
+        # Canvas の <Configure> はタブが表示されて初めて発火する。
+        # データ取得完了時にこのタブが選択されていない場合は発火しないため、
+        # Notebook の <<NotebookTabChanged>> でも描画をトリガーする。
+        _drawn = [False]
+
+        def _trigger_draw(event=None):
+            # 現在選択中のタブが Wi-Fi アナライザーかを確認
+            try:
+                selected = self.nb.select()
+                this_tab = str(tab)
+                is_visible = selected == this_tab
+            except Exception:
+                is_visible = True
+            if is_visible and canvas.winfo_width() > 1:
+                _drawn[0] = True
+                _redraw()
+            elif is_visible and not _drawn[0]:
+                # まだサイズが確定していなければ少し待ってリトライ
+                tab.after(50, _trigger_draw)
+
+        canvas.bind("<Configure>", lambda e: _trigger_draw())
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: _trigger_draw())
+        # 初回: すでにこのタブが表示されている場合のため少し後に強制実行
+        tab.after(200, _trigger_draw)
 
     def _render_printers(self, tab, printers: list):
         """プリンター一覧を表示"""
@@ -3125,6 +3770,244 @@ class PCSpecApp(tk.Tk):
             tag = "odd" if i % 2 == 0 else "even"
             tv.item(k, tags=(tag,))
         tv.heading(col, command=lambda: self._sort_tree(tv, col, not reverse))
+
+
+# ─────────────────────────────────────────────────────────────
+#  Wi-Fi アナライザー: スキャン関数
+# ─────────────────────────────────────────────────────────────
+
+# チャネル番号 → 中心周波数 (MHz) の対応表
+_CH_FREQ = {}
+# 2.4 GHz: ch1=2412, 間隔5 MHz
+for _c in range(1, 14):
+    _CH_FREQ[_c] = 2412 + (_c - 1) * 5
+_CH_FREQ[14] = 2484
+# 5 GHz: 36〜177 (間隔は不均一なので主要チャネルのみ)
+for _c, _f in [
+    (36,5180),(40,5200),(44,5220),(48,5240),
+    (52,5260),(56,5280),(60,5300),(64,5320),
+    (100,5500),(104,5520),(108,5540),(112,5560),(116,5580),
+    (120,5600),(124,5620),(128,5640),(132,5660),(136,5680),(140,5700),
+    (149,5745),(153,5765),(157,5785),(161,5805),(165,5825),
+]:
+    _CH_FREQ[_c] = _f
+
+
+def _freq_to_channel(freq_mhz: int) -> int:
+    """周波数(MHz)からチャネル番号を推定"""
+    best, best_d = 1, 9999
+    for ch, f in _CH_FREQ.items():
+        d = abs(f - freq_mhz)
+        if d < best_d:
+            best, best_d = ch, d
+    return best
+
+
+def _channel_to_freq(ch: int) -> int:
+    return _CH_FREQ.get(ch, 0)
+
+
+def get_wifi_networks() -> list:
+    """
+    周囲の Wi-Fi ネットワーク一覧を返す。
+    戻り値: list of dict
+      - ssid       : str
+      - bssid      : str
+      - channel    : int
+      - freq_mhz   : int   (中心周波数)
+      - width_mhz  : int   (チャネル幅: 20/40/80/160)
+      - signal_dbm : int   (信号強度 dBm)
+      - band       : str   ("2.4GHz" / "5GHz")
+      - auth       : str   (認証方式)
+    エラー時は [{"_error": "原因説明"}] を返す。
+    """
+    sys_name = platform.system()
+    networks = []
+
+    # ── Windows: netsh wlan show networks mode=bssid ──────────
+    if sys_name == "Windows":
+        raw = run_command("netsh wlan show networks mode=bssid", timeout=15)
+        if not raw:
+            # Wi-Fiアダプターが無効・存在しない・サービス停止の可能性
+            # wlan サービスの状態を確認
+            svc = run_command("sc query wlansvc", timeout=5)
+            if "RUNNING" not in svc and "実行中" not in svc:
+                return [{"_error": "Windows の WLAN サービスが停止しています。\n「サービス」で \"WLAN AutoConfig\" を開始してください。"}]
+            return [{"_error": "netsh から応答がありませんでした。\nWi-Fi アダプターが無効になっている可能性があります。"}]
+
+        # "ネットワークが見つかりません" 等のエラーメッセージを検出
+        if "There are" in raw and "networks" not in raw.lower():
+            return [{"_error": f"netsh 応答:\n{raw[:300]}"}]
+        if "SSID" not in raw:
+            return [{"_error": f"Wi-Fi ネットワークが検出されませんでした。\nWi-Fi が有効か確認してください。\n\n[netsh 応答]\n{raw[:400]}"}]
+
+        cur: dict = {}
+
+        def _flush(c):
+            if c.get("ssid") is not None and c.get("bssid"):
+                ch = c.get("channel", 0)
+                if not ch and c.get("freq_mhz"):
+                    ch = _freq_to_channel(c["freq_mhz"])
+                    c["channel"] = ch
+                freq = c.get("freq_mhz") or _channel_to_freq(ch)
+                c["freq_mhz"] = freq
+                c["band"] = "5GHz" if freq >= 5000 else "2.4GHz"
+                c.setdefault("width_mhz", 20)
+                networks.append(c)
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # SSID ブロック開始（日英両対応）
+            # 日本語: "SSID 1                 : MyNetwork"
+            # 英語:  "SSID 1                 : MyNetwork"
+            m_ssid = re.match(r"SSID\s+\d+\s*:\s*(.*)", line)
+            if m_ssid:
+                _flush(cur)
+                cur = {"ssid": m_ssid.group(1).strip()}
+                continue
+
+            # BSSID（日英共通: "BSSID 1  : aa:bb:cc:dd:ee:ff"）
+            m_bssid = re.match(r"BSSID\s+\d+\s*:\s*([0-9a-fA-F:]{17})", line)
+            if m_bssid:
+                if cur.get("bssid"):
+                    _flush(cur)
+                    cur = {k: cur[k] for k in ("ssid",) if k in cur}
+                cur["bssid"] = m_bssid.group(1).upper()
+                continue
+
+            # 信号強度: "シグナル : 78%" / "Signal : 78%"
+            m_sig = re.search(r"(?:シグナル|Signal)\s*:\s*(\d+)\s*%", line)
+            if m_sig:
+                pct = int(m_sig.group(1))
+                cur["signal_dbm"] = int(pct / 2) - 100
+                continue
+
+            # 無線の種類 / Radio type
+            m_radio = re.search(r"(?:無線の種類|Radio\s*type)\s*:\s*(.+)", line)
+            if m_radio:
+                rt = m_radio.group(1).strip()
+                cur["radio_type"] = rt
+                rt_l = rt.lower()
+                if "ax" in rt_l or "802.11ax" in rt_l or "wi-fi 6" in rt_l:
+                    cur.setdefault("width_mhz", 80)
+                elif "ac" in rt_l or "802.11ac" in rt_l:
+                    cur.setdefault("width_mhz", 80)
+                elif "n" in rt_l:
+                    cur.setdefault("width_mhz", 40)
+                else:
+                    cur.setdefault("width_mhz", 20)
+                continue
+
+            # チャネル: "チャネル : 6" / "Channel : 6"
+            m_ch = re.search(r"(?:チャネル|Channel)\s*:\s*(\d+)", line)
+            if m_ch:
+                cur["channel"] = int(m_ch.group(1))
+                continue
+
+            # 認証: "認証 : WPA2-パーソナル" / "Authentication : WPA2-Personal"
+            m_auth = re.search(r"(?:認証|Authentication)\s*:\s*(.+)", line)
+            if m_auth:
+                cur["auth"] = m_auth.group(1).strip()
+                continue
+
+            # 暗号化タイプ (参考情報として保持)
+            m_enc = re.search(r"(?:暗号化|Encryption)\s*:\s*(.+)", line)
+            if m_enc:
+                cur["encryption"] = m_enc.group(1).strip()
+                continue
+
+        _flush(cur)
+
+        # channel → freq が未設定の場合に補完
+        for n in networks:
+            if not n.get("freq_mhz") and n.get("channel"):
+                n["freq_mhz"] = _channel_to_freq(n["channel"])
+                n["band"] = "5GHz" if n["freq_mhz"] >= 5000 else "2.4GHz"
+
+        # netsh でチャネルが取れなかった場合のフォールバック:
+        # netsh wlan show interfaces から接続中APのチャネルを補完
+        if networks and not any(n.get("channel") for n in networks):
+            iface_raw = run_command("netsh wlan show interfaces", timeout=10)
+            if iface_raw:
+                m_ch2 = re.search(r"(?:チャネル|Channel)\s*:\s*(\d+)", iface_raw)
+                if m_ch2:
+                    ch_fallback = int(m_ch2.group(1))
+                    for n in networks:
+                        if not n.get("channel"):
+                            n["channel"] = ch_fallback
+                            if not n.get("freq_mhz"):
+                                n["freq_mhz"] = _channel_to_freq(ch_fallback)
+                                n["band"] = "5GHz" if n["freq_mhz"] >= 5000 else "2.4GHz"
+
+    # ── macOS: airport コマンド ───────────────────────────────
+    elif sys_name == "Darwin":
+        airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+        raw = run_command([airport, "-s"], timeout=15)
+        for line in raw.splitlines()[1:]:   # 1行目はヘッダー
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            try:
+                ssid   = parts[0]
+                bssid  = parts[1].upper()
+                rssi   = int(parts[2])
+                ch_str = parts[3]
+                ch = int(re.sub(r"[^0-9]", "", ch_str.split(",")[0]))
+                freq   = _channel_to_freq(ch)
+                width  = 80 if "80" in ch_str else 40 if "40" in ch_str else 20
+                networks.append({
+                    "ssid": ssid, "bssid": bssid,
+                    "channel": ch, "freq_mhz": freq, "width_mhz": width,
+                    "signal_dbm": rssi,
+                    "band": "5GHz" if freq >= 5000 else "2.4GHz",
+                    "auth": "",
+                })
+            except Exception:
+                continue
+
+    # ── Linux: iwlist / nmcli ─────────────────────────────────
+    elif sys_name == "Linux":
+        raw = run_command(["nmcli", "-t", "-f",
+                           "SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY",
+                           "dev", "wifi"], timeout=15)
+        if raw:
+            for line in raw.splitlines():
+                parts = line.split(":")
+                if len(parts) < 6:
+                    continue
+                try:
+                    ssid  = parts[0]
+                    bssid = parts[1].upper()
+                    ch    = int(parts[2]) if parts[2].isdigit() else 0
+                    freq_str = parts[3]   # e.g. "5180 MHz"
+                    freq  = int(re.sub(r"[^0-9]", "", freq_str.split()[0])) if freq_str else 0
+                    sig   = int(parts[4]) if parts[4].lstrip("-").isdigit() else -80
+                    # nmcli signal は 0-100 の場合と dBm の場合がある
+                    if sig > 0:
+                        sig = int(sig / 2) - 100
+                    auth  = parts[5] if len(parts) > 5 else ""
+                    if not freq and ch:
+                        freq = _channel_to_freq(ch)
+                    networks.append({
+                        "ssid": ssid, "bssid": bssid,
+                        "channel": ch, "freq_mhz": freq, "width_mhz": 20,
+                        "signal_dbm": sig,
+                        "band": "5GHz" if freq >= 5000 else "2.4GHz",
+                        "auth": auth,
+                    })
+                except Exception:
+                    continue
+
+    # dBm の異常値をクランプ
+    for n in networks:
+        n["signal_dbm"] = max(-100, min(-20, n.get("signal_dbm", -80)))
+
+    # 信号強度の強い順にソート
+    networks.sort(key=lambda x: x.get("signal_dbm", -100), reverse=True)
+    return networks
 
 
 def main():
