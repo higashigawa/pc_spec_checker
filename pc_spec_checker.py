@@ -36,13 +36,51 @@ RED        = "#ff4d6d"
 ORANGE     = "#ff8c42"
 
 
-def run_command(cmd):
+def run_command(cmd, timeout=10):
+    """コマンドを実行して stdout を文字列で返す。
+
+    capture_output=True は内部でリーダースレッドを立てるため、
+    WinPython など一部環境でそのスレッドが誤ったエンコーディングを
+    適用して UnicodeDecodeError を起こす。
+    Popen + communicate() で生 bytes を受け取ることで回避する。
+    """
+    is_win = platform.system() == "Windows"
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10,
-            shell=(platform.system() == "Windows")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=is_win,
+            # text=False がデフォルト → bytes で受け取る
         )
-        return result.stdout.strip()
+        try:
+            raw, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return ""
+
+        if not raw:
+            return ""
+
+        if is_win:
+            # コンソールの実際のコードページを優先
+            try:
+                import ctypes
+                cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+                enc = f"cp{cp}" if cp else "cp932"
+            except Exception:
+                enc = "cp932"
+            # 取得したコードページ → utf-8-sig → utf-8 → cp932 → latin-1 の順で試みる
+            for candidate in (enc, "utf-8-sig", "utf-8", "cp932", "latin-1"):
+                try:
+                    return raw.decode(candidate, errors="strict").strip()
+                except (LookupError, UnicodeDecodeError):
+                    continue
+            # どれも厳格デコードに失敗したら cp932 で置換
+            return raw.decode("cp932", errors="replace").strip()
+
+        return raw.decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
 
@@ -229,9 +267,8 @@ def _get_arp_table() -> dict:
     sys_name = platform.system()
     try:
         if sys_name == "Windows":
-            r = subprocess.run(["arp", "-a"], capture_output=True,
-                               text=True, timeout=10, shell=True)
-            for line in r.stdout.splitlines():
+            arp_out = run_command("arp -a")
+            for line in arp_out.splitlines():
                 # "  192.168.1.1          aa-bb-cc-dd-ee-ff     動的"
                 parts = line.split()
                 if len(parts) >= 2:
@@ -241,9 +278,8 @@ def _get_arp_table() -> dict:
                         mac = mac_part.replace("-", ":").upper()
                         table[ip_part] = (mac, _oui_vendor(mac))
         else:
-            r = subprocess.run(["arp", "-n"], capture_output=True,
-                               text=True, timeout=10)
-            for line in r.stdout.splitlines():
+            arp_out = run_command(["arp", "-n"])
+            for line in arp_out.splitlines():
                 parts = line.split()
                 if len(parts) >= 3:
                     ip_part  = parts[0]
@@ -539,13 +575,13 @@ def get_printer_info():
                 tmp_path = tf.name
             for ps_exe in ["pwsh", "powershell"]:
                 try:
-                    r = subprocess.run(
+                    out = run_command(
                         [ps_exe, "-NoProfile", "-NonInteractive",
                          "-ExecutionPolicy", "Bypass", "-File", tmp_path],
-                        capture_output=True, text=True, timeout=30
+                        timeout=30
                     )
-                    if r.returncode == 0 and "---PRINTER---" in r.stdout:
-                        printers = _parse_printer_lines(r.stdout)
+                    if out and "---PRINTER---" in out:
+                        printers = _parse_printer_lines(out)
                         break
                 except FileNotFoundError:
                     continue
@@ -574,13 +610,13 @@ def get_printer_info():
                 )
                 for ps_exe in ["pwsh", "powershell"]:
                     try:
-                        r = subprocess.run(
+                        out = run_command(
                             [ps_exe, "-NoProfile", "-NonInteractive",
                              "-ExecutionPolicy", "Bypass", "-Command", cmd],
-                            capture_output=True, text=True, timeout=30
+                            timeout=30
                         )
-                        if r.returncode == 0 and "---PRINTER---" in r.stdout:
-                            printers = _parse_printer_lines(r.stdout)
+                        if out and "---PRINTER---" in out:
+                            printers = _parse_printer_lines(out)
                             break
                     except FileNotFoundError:
                         continue
@@ -590,15 +626,15 @@ def get_printer_info():
         # ── 方法3: wmic フォールバック ────────────────────────
         if not printers:
             try:
-                r = subprocess.run(
+                wmic_out = run_command(
                     "wmic printer get Name,DriverName,PortName,Default,Shared,PrinterStatus /value",
-                    capture_output=True, text=True, timeout=20, shell=True
+                    timeout=20
                 )
                 cur = {}
                 def flush(c):
                     if c.get("プリンター名"):
                         printers.append(c)
-                for raw in r.stdout.splitlines():
+                for raw in wmic_out.splitlines():
                     raw = raw.strip()
                     if not raw:
                         flush(cur); cur = {}
@@ -886,12 +922,12 @@ foreach ($p in $paths) {
                 tf.write(ps_script)
                 tmp_path = tf.name
 
-            result = subprocess.run(
+            result_out = run_command(
                 ["powershell", "-NoProfile", "-NonInteractive",
                  "-ExecutionPolicy", "Bypass", "-File", tmp_path],
-                capture_output=True, text=True, timeout=60
+                timeout=60
             )
-            lines = result.stdout.splitlines()
+            lines = result_out.splitlines()
             # 名前でソート
             lines.sort(key=lambda x: x.lower())
             for line in lines:
@@ -961,6 +997,14 @@ def get_network_info():
                 continue
 
             entry = {"インターフェース": iface}
+            # Wi-Fi / 有線 / Bluetooth の種別判定
+            lower = iface.lower()
+            if any(k in lower for k in ("wi-fi", "wifi", "wireless", "wlan", "無線")):
+                entry["種別"] = "Wi-Fi (無線LAN)"
+            elif any(k in lower for k in ("ethernet", "eth", "イーサネット", "ローカル")):
+                entry["種別"] = "有線LAN"
+            elif any(k in lower for k in ("bluetooth", "ブルートゥース")):
+                entry["種別"] = "Bluetooth"
             if mac:
                 entry["MACアドレス"] = mac.upper()
             if ipv4:
@@ -973,6 +1017,38 @@ def get_network_info():
                 entry["リンク速度"] = f"{st.speed} Mbps" if st.speed else "不明"
                 entry["状態"] = "稼働中" if st.isup else "停止中"
             interfaces.append(entry)
+
+        # Windows: netsh で Wi-Fi の SSID・信号強度などを補完
+        if platform.system() == "Windows":
+            netsh_out = run_command("netsh wlan show interfaces")
+            if netsh_out:
+                blocks = re.split(r"\n(?=\s*(?:名前|Name)\s*:)", netsh_out)
+                for block in blocks:
+                    m_name = re.search(r"(?:名前|Name)\s*:\s*(.+)", block)
+                    if not m_name:
+                        continue
+                    adapter_name = m_name.group(1).strip()
+                    target = next(
+                        (e for e in interfaces
+                         if adapter_name in e.get("インターフェース", "")
+                         or e.get("インターフェース", "") in adapter_name),
+                        None
+                    )
+                    if target is None:
+                        continue
+                    for pat, key in [
+                        (r"SSID\s*:\s*(.+)",                     "SSID"),
+                        (r"BSSID\s*:\s*(.+)",                    "BSSID"),
+                        (r"(?:信号|Signal)\s*:\s*(\d+\s*%)",     "信号強度"),
+                        (r"(?:無線の種類|Radio type)\s*:\s*(.+)", "規格"),
+                        (r"(?:チャネル|Channel)\s*:\s*(.+)",      "チャネル"),
+                        (r"(?:受信速度|Receive rate)\s*:\s*(.+)", "受信速度"),
+                        (r"(?:送信速度|Transmit rate)\s*:\s*(.+)","送信速度"),
+                    ]:
+                        m = re.search(pat, block)
+                        if m:
+                            target[key] = m.group(1).strip()
+
         return interfaces
 
     # ── psutil なし: 標準ライブラリ + OS コマンドで取得 ──
@@ -1045,42 +1121,138 @@ def get_network_info():
             interfaces.append(iface_data)
 
     elif sys_name == "Windows":
-        out = run_command("getmac /v /fo list")
+        # ── ipconfig /all で全情報を一括取得（Wi-Fi対応）──────
+        ipcfg_all = run_command("ipconfig /all")
         current = {}
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                if current:
-                    interfaces.append(current)
-                    current = {}
-                continue
-            if "接続名" in line or "Connection Name" in line:
-                current["インターフェース"] = line.split(":", 1)[1].strip()
-            elif "物理アドレス" in line or "Physical Address" in line:
-                current["MACアドレス"] = line.split(":", 1)[1].strip().upper()
-            elif "トランスポート名" in line or "Transport Name" in line:
-                current["トランスポート"] = line.split(":", 1)[1].strip()
-        if current:
-            interfaces.append(current)
+        iface_block_name = None
 
-        # IPv4・サブネットマスクは ipconfig から補完
-        ipcfg = run_command("ipconfig")
-        iface_name = None
-        for line in ipcfg.splitlines():
-            m = re.match(r"^(\S.*):$", line)
-            if m:
-                iface_name = m.group(1).strip()
-            m_ip   = re.search(r"IPv4.*?:\s+(\d+\.\d+\.\d+\.\d+)", line)
-            m_mask = re.search(r"サブネット マスク.*?:\s+(\d+\.\d+\.\d+\.\d+)|Subnet Mask.*?:\s+(\d+\.\d+\.\d+\.\d+)", line)
-            if m_ip and iface_name:
+        def _flush_win(c):
+            # MACもIPもない空エントリは捨てる
+            if c.get("インターフェース") and (
+                c.get("MACアドレス") or c.get("IPv4アドレス")
+            ):
+                interfaces.append(c)
+
+        for line in ipcfg_all.splitlines():
+            # アダプター見出し行: "イーサネット アダプター ローカル エリア接続:" など
+            # 英語環境: "Ethernet adapter Local Area Connection:"
+            # Wi-Fi: "無線 LAN アダプター Wi-Fi:" / "Wireless LAN adapter Wi-Fi:"
+            m_head = re.match(r"^(\S.*\S)\s*:$", line)
+            if m_head and not line.startswith(" "):
+                _flush_win(current)
+                current = {}
+                iface_block_name = m_head.group(1).strip()
+                current["インターフェース"] = iface_block_name
+                # Wi-Fi / 無線 LAN の判定
+                lower = iface_block_name.lower()
+                if any(k in lower for k in ("wi-fi", "wifi", "wireless", "無線")):
+                    current["種別"] = "Wi-Fi (無線LAN)"
+                elif any(k in lower for k in ("ethernet", "イーサネット", "ローカル", "local area")):
+                    current["種別"] = "有線LAN"
+                elif any(k in lower for k in ("bluetooth", "ブルートゥース")):
+                    current["種別"] = "Bluetooth"
+                continue
+
+            if not iface_block_name:
+                continue
+
+            line_s = line.strip()
+
+            # MACアドレス（物理アドレス）
+            m_mac = re.search(
+                r"(?:物理アドレス|Physical Address)[^\:]*:\s*([0-9A-Fa-f]{2}[-:][0-9A-Fa-f]{2}[-:][0-9A-Fa-f]{2}[-:][0-9A-Fa-f]{2}[-:][0-9A-Fa-f]{2}[-:][0-9A-Fa-f]{2})",
+                line_s
+            )
+            if m_mac:
+                current["MACアドレス"] = m_mac.group(1).replace("-", ":").upper()
+                continue
+
+            # IPv4アドレス
+            m_ip = re.search(
+                r"(?:IPv4 アドレス|IPv4 Address)[^\:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+                line_s
+            )
+            if m_ip:
+                current["IPv4アドレス"] = m_ip.group(1)
+                continue
+
+            # サブネットマスク
+            m_mask = re.search(
+                r"(?:サブネット マスク|Subnet Mask)[^\:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+                line_s
+            )
+            if m_mask:
+                current["サブネットマスク"] = m_mask.group(1)
+                continue
+
+            # デフォルトゲートウェイ
+            m_gw = re.search(
+                r"(?:デフォルト ゲートウェイ|Default Gateway)[^\:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+                line_s
+            )
+            if m_gw:
+                current["デフォルトゲートウェイ"] = m_gw.group(1)
+                continue
+
+            # DNSサーバー
+            m_dns = re.search(
+                r"(?:DNS サーバー|DNS Servers)[^\:]*:\s*(\d+\.\d+\.\d+\.\d+)",
+                line_s
+            )
+            if m_dns and "DNSサーバー" not in current:
+                current["DNSサーバー"] = m_dns.group(1)
+                continue
+
+            # DHCP有効/無効
+            m_dhcp = re.search(r"(?:DHCP 有効|DHCP Enabled)[^\:]*:\s*(\S+)", line_s)
+            if m_dhcp:
+                val = m_dhcp.group(1)
+                current["DHCP"] = "有効" if val.lower() in ("yes", "はい") else "無効"
+                continue
+
+        _flush_win(current)
+
+        # ── Wi-Fi 追加情報: netsh で SSID・信号強度を補完 ──────
+        netsh_out = run_command("netsh wlan show interfaces")
+        if netsh_out:
+            # 接続中のWi-Fiアダプターごとにブロックを切り出す
+            blocks = re.split(r"\n(?=\s*名前\s*:|Name\s*:)", netsh_out)
+            for block in blocks:
+                # アダプター名
+                m_name = re.search(r"(?:名前|Name)\s*:\s*(.+)", block)
+                if not m_name:
+                    continue
+                adapter_name = m_name.group(1).strip()
+
+                # 対応するinterfacesエントリを探す（部分一致）
+                target = None
                 for entry in interfaces:
-                    if iface_name in entry.get("インターフェース", ""):
-                        entry["IPv4アドレス"] = m_ip.group(1)
-            if m_mask and iface_name:
-                mask_val = m_mask.group(1) or m_mask.group(2)
-                for entry in interfaces:
-                    if iface_name in entry.get("インターフェース", ""):
-                        entry["サブネットマスク"] = mask_val
+                    iname = entry.get("インターフェース", "")
+                    if adapter_name in iname or iname in adapter_name:
+                        target = entry
+                        break
+                if target is None:
+                    continue
+
+                m_ssid    = re.search(r"SSID\s*:\s*(.+)", block)
+                m_bssid   = re.search(r"BSSID\s*:\s*(.+)", block)
+                m_signal  = re.search(r"(?:信号|Signal)\s*:\s*(\d+\s*%)", block)
+                m_radio   = re.search(r"(?:無線の種類|Radio type)\s*:\s*(.+)", block)
+                m_channel = re.search(r"(?:チャネル|Channel)\s*:\s*(.+)", block)
+                m_speed   = re.search(r"(?:受信速度|Receive rate|送受信速度|Transmit rate)\s*:\s*(.+)", block)
+
+                if m_ssid:
+                    target["SSID"] = m_ssid.group(1).strip()
+                if m_bssid:
+                    target["BSSID"] = m_bssid.group(1).strip().upper()
+                if m_signal:
+                    target["信号強度"] = m_signal.group(1).strip()
+                if m_radio:
+                    target["規格"] = m_radio.group(1).strip()
+                if m_channel:
+                    target["チャネル"] = m_channel.group(1).strip()
+                if m_speed:
+                    target["リンク速度"] = m_speed.group(1).strip()
 
     if not interfaces:
         interfaces.append({"インターフェース": "不明", "MACアドレス": mac_str})
@@ -1205,13 +1377,13 @@ def get_machine_info():
                 tmp_path = tf.name
             for ps_exe in ["pwsh", "powershell"]:
                 try:
-                    r = subprocess.run(
+                    r_out = run_command(
                         [ps_exe, "-NoProfile", "-NonInteractive",
                          "-ExecutionPolicy", "Bypass", "-File", tmp_path],
-                        capture_output=True, text=True, timeout=20
+                        timeout=20
                     )
-                    if r.stdout.strip():
-                        for line in r.stdout.splitlines():
+                    if r_out.strip():
+                        for line in r_out.splitlines():
                             line = line.strip()
                             if ":" not in line:
                                 continue
@@ -1287,15 +1459,11 @@ def get_os_info():
 
 
 def _ps_run(script):
-    """PowerShell コマンドを実行して stdout を返す"""
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=15
-        )
-        return r.stdout.strip()
-    except Exception:
-        return ""
+    """PowerShell コマンドを実行して stdout を返す（WinPython CP932対応）"""
+    return run_command(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        timeout=15
+    )
 
 
 def get_gpu_info():
